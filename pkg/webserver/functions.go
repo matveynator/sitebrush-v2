@@ -27,6 +27,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode"
 
@@ -92,6 +93,22 @@ type backupRecord struct {
 	Checksum  string    `json:"checksum"`
 	Size      int64     `json:"size"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+type restoreRollbackEntry struct {
+	Path        string
+	Root        string
+	Exists      bool
+	Content     []byte
+	Mode        fs.FileMode
+	CreatedDirs []string
+}
+
+type restoreTarget struct {
+	ArchiveName string
+	Path        string
+	Root        string
+	File        *zip.File
 }
 
 type pageMetadata struct {
@@ -767,6 +784,10 @@ func (s siteService) setFreeze(responseWriter http.ResponseWriter, request *http
 		http.Error(responseWriter, "Forbidden", http.StatusForbidden)
 		return
 	}
+	if err := s.publishSnapshot(); err != nil {
+		http.Error(responseWriter, "Could not publish site snapshot", http.StatusInternalServerError)
+		return
+	}
 	state := siteState{Frozen: frozen, UpdatedAt: time.Now().UTC()}
 	if err := s.writeSiteState(state); err != nil {
 		http.Error(responseWriter, "Could not update site state", http.StatusInternalServerError)
@@ -797,6 +818,23 @@ func (s siteService) backup(responseWriter http.ResponseWriter, request *http.Re
 	}
 	if !s.validCSRF(request, session) {
 		http.Error(responseWriter, "Forbidden", http.StatusForbidden)
+		return
+	}
+	if request.FormValue("restore") != "" {
+		record, err := s.restoreBackup(request.FormValue("path"))
+		if err != nil {
+			switch {
+			case errors.Is(err, errUnsafePath):
+				http.Error(responseWriter, "Forbidden", http.StatusForbidden)
+			case errors.Is(err, os.ErrNotExist):
+				http.Error(responseWriter, "Backup not found", http.StatusNotFound)
+			default:
+				http.Error(responseWriter, "Restore failed", http.StatusBadRequest)
+			}
+			return
+		}
+		responseWriter.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(responseWriter).Encode(record)
 		return
 	}
 	record, err := s.createBackup()
@@ -1688,8 +1726,12 @@ func (s siteService) handle(responseWriter http.ResponseWriter, request *http.Re
 
 	switch action {
 	case "":
-		if checkFileExist(fileName) {
-			http.ServeFile(responseWriter, request, fileName)
+		staticFileName := fileName
+		if snapshotFileName, ok := s.snapshotFileForAnonymousRequest(request); ok {
+			staticFileName = snapshotFileName
+		}
+		if checkFileExist(staticFileName) {
+			http.ServeFile(responseWriter, request, staticFileName)
 			return
 		}
 		requestURI, err := s.canonicalRequestURIForFile(fileName)
@@ -1766,6 +1808,9 @@ func (s siteService) handleLegacyStatic(responseWriter http.ResponseWriter, requ
 			http.Error(responseWriter, "Forbidden", http.StatusForbidden)
 			return true
 		}
+		if snapshotFileName, ok := s.snapshotFileForAnonymousRequest(request); ok {
+			fileName = snapshotFileName
+		}
 		if !checkFileExist(fileName) {
 			http.Error(responseWriter, "Not Found", http.StatusNotFound)
 			return true
@@ -1773,28 +1818,37 @@ func (s siteService) handleLegacyStatic(responseWriter http.ResponseWriter, requ
 		http.ServeFile(responseWriter, request, fileName)
 		return true
 	case request.URL.Path == "/f" || strings.HasPrefix(request.URL.Path, "/f/"):
-		host, err := canonicalHostFromRequest(request)
-		if err != nil {
-			http.Error(responseWriter, "Bad Request", http.StatusBadRequest)
-			return true
-		}
-		roots, err := s.domainPaths(host)
-		if err != nil {
-			http.Error(responseWriter, "Bad Request", http.StatusBadRequest)
-			return true
-		}
 		mediaPath := strings.TrimPrefix(request.URL.Path, "/f")
 		if mediaPath == "" || mediaPath == "/" {
 			http.Error(responseWriter, "Not Found", http.StatusNotFound)
 			return true
 		}
-		fileName, err := safePathUnderRoot(roots.MediaRoot, mediaPath, "", false)
-		if err != nil {
-			http.Error(responseWriter, "Forbidden", http.StatusForbidden)
-			return true
+		fileName := ""
+		if snapshotFileName, ok := s.snapshotMediaFileForAnonymousRequest(request, mediaPath); ok {
+			fileName = snapshotFileName
+		} else {
+			host, err := canonicalHostFromRequest(request)
+			if err != nil {
+				http.Error(responseWriter, "Bad Request", http.StatusBadRequest)
+				return true
+			}
+			roots, err := s.domainPaths(host)
+			if err != nil {
+				http.Error(responseWriter, "Bad Request", http.StatusBadRequest)
+				return true
+			}
+			fileName, err = safePathUnderRoot(roots.MediaRoot, mediaPath, "", false)
+			if err != nil {
+				http.Error(responseWriter, "Forbidden", http.StatusForbidden)
+				return true
+			}
 		}
 		info, err := os.Stat(fileName)
-		if err != nil || info.IsDir() {
+		if err != nil {
+			http.Error(responseWriter, "Not Found", http.StatusNotFound)
+			return true
+		}
+		if info.IsDir() {
 			http.Error(responseWriter, "Not Found", http.StatusNotFound)
 			return true
 		}
@@ -2012,6 +2066,29 @@ func (s siteService) statePath() string {
 	return filepath.Join(s.archiveRoot(), "site-state.json")
 }
 
+func (s siteService) publishedRoot() string {
+	return filepath.Join(s.archiveRoot(), "published")
+}
+
+func (s siteService) publishedMediaRoot(host string) string {
+	return filepath.Join(s.publishedRoot(), ".sitebrush-media", "domains", host, "media")
+}
+
+func (s siteService) loadSiteState() (siteState, error) {
+	data, err := os.ReadFile(s.statePath())
+	if errors.Is(err, os.ErrNotExist) {
+		return siteState{}, nil
+	}
+	if err != nil {
+		return siteState{}, err
+	}
+	var state siteState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return siteState{}, err
+	}
+	return state, nil
+}
+
 func (s siteService) writeSiteState(state siteState) error {
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
@@ -2020,8 +2097,215 @@ func (s siteService) writeSiteState(state siteState) error {
 	return atomicWriteFile(s.statePath(), data, 0o600)
 }
 
+func (s siteService) snapshotFileForAnonymousRequest(request *http.Request) (string, bool) {
+	if _, ok := s.sessions.get(request); ok {
+		return "", false
+	}
+	state, err := s.loadSiteState()
+	if err != nil || !state.Frozen {
+		if err != nil {
+			log.Printf("SiteBrush could not load freeze state: %v", err)
+		}
+		return "", false
+	}
+	fileName, err := safePathUnderRoot(s.publishedRoot(), request.URL.Path, s.config.WEB_INDEX_FILE, true)
+	if err != nil {
+		return "", false
+	}
+	return fileName, true
+}
+
+func (s siteService) snapshotMediaFileForAnonymousRequest(request *http.Request, mediaPath string) (string, bool) {
+	if _, ok := s.sessions.get(request); ok {
+		return "", false
+	}
+	state, err := s.loadSiteState()
+	if err != nil || !state.Frozen {
+		if err != nil {
+			log.Printf("SiteBrush could not load freeze state: %v", err)
+		}
+		return "", false
+	}
+	host, err := canonicalHostFromRequest(request)
+	if err != nil {
+		return "", false
+	}
+	fileName, err := safePathUnderRoot(s.publishedMediaRoot(host), mediaPath, "", false)
+	if err != nil {
+		return "", false
+	}
+	return fileName, true
+}
+
+func (s siteService) publishSnapshot() error {
+	rootPath, err := filepath.Abs(s.config.WEB_FILE_PATH)
+	if err != nil {
+		return err
+	}
+	publishedRoot, err := filepath.Abs(s.publishedRoot())
+	if err != nil {
+		return err
+	}
+	if pathIsInsideRoot(rootPath, publishedRoot) {
+		return errors.New("published snapshot destination cannot be inside web root")
+	}
+	if err := os.MkdirAll(filepath.Dir(publishedRoot), 0o755); err != nil {
+		return err
+	}
+	tmpRoot, err := os.MkdirTemp(filepath.Dir(publishedRoot), ".published-*")
+	if err != nil {
+		return err
+	}
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.RemoveAll(tmpRoot)
+		}
+	}()
+	if err := copyDirectoryContents(rootPath, tmpRoot); err != nil {
+		return err
+	}
+	if err := s.copyPublishedMediaSnapshots(tmpRoot); err != nil {
+		return err
+	}
+	oldRoot := publishedRoot + ".old"
+	_ = os.RemoveAll(oldRoot)
+	if err := os.Rename(publishedRoot, oldRoot); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.Rename(tmpRoot, publishedRoot); err != nil {
+		if restoreErr := os.Rename(oldRoot, publishedRoot); restoreErr != nil && !errors.Is(restoreErr, os.ErrNotExist) {
+			return fmt.Errorf("publish snapshot failed: %w; restore failed: %v", err, restoreErr)
+		}
+		return err
+	}
+	cleanup = false
+	if err := syncDir(filepath.Dir(publishedRoot)); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(oldRoot); err != nil {
+		return err
+	}
+	return nil
+}
+
+func copyDirectoryContents(sourceRoot, targetRoot string) error {
+	rootPath, err := filepath.Abs(sourceRoot)
+	if err != nil {
+		return err
+	}
+	if evaluatedRoot, err := filepath.EvalSymlinks(rootPath); err == nil {
+		rootPath = evaluatedRoot
+	}
+	targetRoot, err = filepath.Abs(targetRoot)
+	if err != nil {
+		return err
+	}
+	return filepath.WalkDir(rootPath, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		absolutePath, err := filepath.Abs(path)
+		if err != nil {
+			return err
+		}
+		if !pathIsInsideRoot(rootPath, absolutePath) {
+			return errUnsafePath
+		}
+		relativePath, err := filepath.Rel(rootPath, absolutePath)
+		if err != nil {
+			return err
+		}
+		if relativePath == "." {
+			return nil
+		}
+		targetPath := filepath.Join(targetRoot, relativePath)
+		if entry.Type()&os.ModeSymlink != 0 {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if entry.IsDir() {
+			return os.MkdirAll(targetPath, 0o755)
+		}
+		return copyRegularFile(absolutePath, targetPath)
+	})
+}
+
+func (s siteService) copyPublishedMediaSnapshots(targetPublishedRoot string) error {
+	domainsRoot := filepath.Join(s.archiveRoot(), "domains")
+	entries, err := os.ReadDir(domainsRoot)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || strings.Contains(entry.Name(), string(filepath.Separator)) {
+			continue
+		}
+		sourceMediaRoot := filepath.Join(domainsRoot, entry.Name(), "media")
+		if _, err := os.Stat(sourceMediaRoot); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			return err
+		}
+		targetMediaRoot := filepath.Join(targetPublishedRoot, ".sitebrush-media", "domains", entry.Name(), "media")
+		if err := copyDirectoryContents(sourceMediaRoot, targetMediaRoot); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func copyRegularFile(sourcePath, targetPath string) error {
+	info, err := os.Lstat(sourcePath)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil
+	}
+	if !info.Mode().IsRegular() {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+		return err
+	}
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	openedInfo, err := source.Stat()
+	if err != nil {
+		return err
+	}
+	if !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
+		return errUnsafePath
+	}
+	target, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode().Perm())
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(target, source); err != nil {
+		_ = target.Close()
+		return err
+	}
+	if err := target.Close(); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (s siteService) createBackup() (backupRecord, error) {
 	rootPath, err := filepath.Abs(s.config.WEB_FILE_PATH)
+	if err != nil {
+		return backupRecord{}, err
+	}
+	evaluatedRootPath, err := filepath.EvalSymlinks(rootPath)
 	if err != nil {
 		return backupRecord{}, err
 	}
@@ -2029,11 +2313,25 @@ func (s siteService) createBackup() (backupRecord, error) {
 	if err := os.MkdirAll(backupDir, 0o755); err != nil {
 		return backupRecord{}, err
 	}
+	archiveRoot, err := filepath.Abs(s.archiveRoot())
+	if err != nil {
+		return backupRecord{}, err
+	}
+	evaluatedArchiveRoot, err := filepath.EvalSymlinks(archiveRoot)
+	if err != nil {
+		return backupRecord{}, err
+	}
 	absoluteBackupDir, err := filepath.Abs(backupDir)
 	if err != nil {
 		return backupRecord{}, err
 	}
-	if pathIsInsideRoot(rootPath, absoluteBackupDir) {
+	evaluatedBackupDir, err := filepath.EvalSymlinks(absoluteBackupDir)
+	if err != nil {
+		return backupRecord{}, err
+	}
+	if pathIsInsideRoot(rootPath, absoluteBackupDir) ||
+		pathIsInsideRoot(evaluatedRootPath, evaluatedArchiveRoot) ||
+		pathIsInsideRoot(evaluatedRootPath, evaluatedBackupDir) {
 		return backupRecord{}, errors.New("backup destination cannot be inside web root")
 	}
 
@@ -2050,40 +2348,25 @@ func (s siteService) createBackup() (backupRecord, error) {
 	}()
 
 	zipWriter := zip.NewWriter(tmpFile)
-	if err := filepath.WalkDir(rootPath, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.IsDir() {
-			return nil
-		}
-		if entry.Type()&os.ModeSymlink != 0 {
-			return nil
-		}
-		absolutePath, err := filepath.Abs(path)
-		if err != nil {
-			return err
-		}
-		if !pathIsInsideRoot(rootPath, absolutePath) {
-			return errors.New("unsafe backup path")
-		}
-		relativePath, err := filepath.Rel(rootPath, absolutePath)
-		if err != nil {
-			return err
-		}
-		archivePath := filepath.ToSlash(relativePath)
-		writer, err := zipWriter.Create(archivePath)
-		if err != nil {
-			return err
-		}
-		source, err := os.Open(absolutePath)
-		if err != nil {
-			return err
-		}
-		defer source.Close()
-		_, err = io.Copy(writer, source)
-		return err
-	}); err != nil {
+	manifest := map[string]any{
+		"format":              "sitebrush-v2-foundation",
+		"created_at":          time.Now().UTC(),
+		"web_prefix":          "web/",
+		"archive_prefix":      "archive/",
+		"database_restore":    "deferred",
+		"auth_users_included": false,
+	}
+	if err := addJSONToZip(zipWriter, "sitebrush-backup.json", manifest); err != nil {
+		_ = zipWriter.Close()
+		_ = tmpFile.Close()
+		return backupRecord{}, err
+	}
+	if err := addDirectoryToZip(zipWriter, rootPath, "web"); err != nil {
+		_ = zipWriter.Close()
+		_ = tmpFile.Close()
+		return backupRecord{}, err
+	}
+	if err := s.addSafeArchiveMetadataToZip(zipWriter); err != nil {
 		_ = zipWriter.Close()
 		_ = tmpFile.Close()
 		return backupRecord{}, err
@@ -2100,8 +2383,12 @@ func (s siteService) createBackup() (backupRecord, error) {
 		return backupRecord{}, err
 	}
 
-	finalPath := filepath.Join(backupDir, "sitebrush-backup-"+time.Now().UTC().Format("20060102T150405Z")+".zip")
+	finalPath, err := reserveUniqueBackupPath(backupDir, time.Now().UTC())
+	if err != nil {
+		return backupRecord{}, err
+	}
 	if err := os.Rename(tmpName, finalPath); err != nil {
+		_ = os.Remove(finalPath)
 		return backupRecord{}, err
 	}
 	cleanup = false
@@ -2122,6 +2409,148 @@ func (s siteService) createBackup() (backupRecord, error) {
 		return backupRecord{}, err
 	}
 	return record, nil
+}
+
+func addJSONToZip(zipWriter *zip.Writer, name string, value any) error {
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return err
+	}
+	writer, err := zipWriter.Create(name)
+	if err != nil {
+		return err
+	}
+	_, err = writer.Write(data)
+	return err
+}
+
+func reserveUniqueBackupPath(backupDir string, createdAt time.Time) (string, error) {
+	for attempt := 0; attempt < 16; attempt++ {
+		suffix, err := randomRevisionSuffix()
+		if err != nil {
+			return "", err
+		}
+		name := fmt.Sprintf("sitebrush-backup-%s-%s.zip", createdAt.Format("20060102T150405Z"), suffix)
+		path := filepath.Join(backupDir, name)
+		reservation, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		if err := reservation.Close(); err != nil {
+			_ = os.Remove(path)
+			return "", err
+		}
+		return path, nil
+	}
+	return "", errors.New("could not allocate unique backup filename")
+}
+
+func (s siteService) addSafeArchiveMetadataToZip(zipWriter *zip.Writer) error {
+	archiveRoot, err := filepath.Abs(s.archiveRoot())
+	if err != nil {
+		return err
+	}
+	files := map[string]string{
+		"site-state.json": s.statePath(),
+		"redirects.json":  s.redirectsPath(),
+	}
+	for archiveName, sourcePath := range files {
+		if err := addFileToZipIfExists(zipWriter, sourcePath, pathpkg.Join("archive", archiveName)); err != nil {
+			return err
+		}
+	}
+	for _, dir := range []string{"metadata", "templates"} {
+		if err := addDirectoryToZipIfExists(zipWriter, filepath.Join(archiveRoot, dir), pathpkg.Join("archive", dir)); err != nil {
+			return err
+		}
+	}
+	domainsRoot := filepath.Join(archiveRoot, "domains")
+	entries, err := os.ReadDir(domainsRoot)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || strings.Contains(entry.Name(), string(filepath.Separator)) {
+			continue
+		}
+		for _, dir := range []string{"media", "media-metadata"} {
+			sourcePath := filepath.Join(domainsRoot, entry.Name(), dir)
+			archivePrefix := pathpkg.Join("archive", "domains", entry.Name(), dir)
+			if err := addDirectoryToZipIfExists(zipWriter, sourcePath, archivePrefix); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func addDirectoryToZipIfExists(zipWriter *zip.Writer, root, archivePrefix string) error {
+	if _, err := os.Stat(root); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	return addDirectoryToZip(zipWriter, root, archivePrefix)
+}
+
+func addFileToZipIfExists(zipWriter *zip.Writer, sourcePath, archivePath string) error {
+	if _, err := os.Stat(sourcePath); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	return addFileToZip(zipWriter, sourcePath, archivePath)
+}
+
+func addDirectoryToZip(zipWriter *zip.Writer, root, archivePrefix string) error {
+	rootPath, err := filepath.Abs(root)
+	if err != nil {
+		return err
+	}
+	return filepath.WalkDir(rootPath, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
+		absolutePath, err := filepath.Abs(path)
+		if err != nil {
+			return err
+		}
+		if !pathIsInsideRoot(rootPath, absolutePath) {
+			return errors.New("unsafe backup path")
+		}
+		relativePath, err := filepath.Rel(rootPath, absolutePath)
+		if err != nil {
+			return err
+		}
+		archivePath := pathpkg.Join(archivePrefix, filepath.ToSlash(relativePath))
+		return addFileToZip(zipWriter, absolutePath, archivePath)
+	})
+}
+
+func addFileToZip(zipWriter *zip.Writer, sourcePath, archivePath string) error {
+	writer, err := zipWriter.Create(archivePath)
+	if err != nil {
+		return err
+	}
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	_, err = io.Copy(writer, source)
+	return err
 }
 
 func (s siteService) recordBackup(record backupRecord, status, errorMessage string) error {
@@ -2154,6 +2583,416 @@ func (s siteService) recordBackup(record backupRecord, status, errorMessage stri
 		errorMessage,
 	)
 	return err
+}
+
+func (s siteService) restoreBackup(backupPath string) (backupRecord, error) {
+	backupPath = strings.TrimSpace(backupPath)
+	if backupPath == "" {
+		return backupRecord{}, errUnsafePath
+	}
+	backupRoot, err := filepath.Abs(filepath.Join(s.archiveRoot(), "backups"))
+	if err != nil {
+		return backupRecord{}, err
+	}
+	absoluteBackupPath, err := filepath.Abs(backupPath)
+	if err != nil {
+		return backupRecord{}, err
+	}
+	if !pathIsInsideRoot(backupRoot, absoluteBackupPath) {
+		return backupRecord{}, errUnsafePath
+	}
+	backupInfo, err := os.Lstat(absoluteBackupPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return backupRecord{}, os.ErrNotExist
+		}
+		return backupRecord{}, err
+	}
+	if backupInfo.Mode()&os.ModeSymlink != 0 || !backupInfo.Mode().IsRegular() {
+		return backupRecord{}, errUnsafePath
+	}
+	reader, err := zip.OpenReader(absoluteBackupPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return backupRecord{}, os.ErrNotExist
+		}
+		return backupRecord{}, err
+	}
+	defer reader.Close()
+	if err := s.validateRestoreArchive(reader.File); err != nil {
+		return backupRecord{}, err
+	}
+	targets, err := s.collectRestoreTargets(reader.File)
+	if err != nil {
+		return backupRecord{}, err
+	}
+	rollbackEntries := make([]restoreRollbackEntry, 0, len(targets))
+	for _, target := range targets {
+		rollbackEntry, err := captureRestoreRollbackEntry(target.Root, target.Path)
+		if err != nil {
+			return backupRecord{}, err
+		}
+		rollbackEntries = append(rollbackEntries, rollbackEntry)
+	}
+	restoreStarted := false
+	rollbackOnError := func(restoreErr error) (backupRecord, error) {
+		if restoreStarted {
+			if rollbackErr := rollbackRestore(rollbackEntries); rollbackErr != nil {
+				return backupRecord{}, fmt.Errorf("restore failed: %w; rollback failed: %v", restoreErr, rollbackErr)
+			}
+		}
+		return backupRecord{}, restoreErr
+	}
+	for _, target := range targets {
+		restoreStarted = true
+		if err := restoreZipFile(target.File, target.Root, target.Path); err != nil {
+			return rollbackOnError(err)
+		}
+	}
+	checksum, size, err := fileChecksum(absoluteBackupPath)
+	if err != nil {
+		return rollbackOnError(err)
+	}
+	record := backupRecord{Path: absoluteBackupPath, Checksum: checksum, Size: size, CreatedAt: time.Now().UTC()}
+	if err := s.recordBackup(record, "restored", ""); err != nil {
+		return rollbackOnError(err)
+	}
+	return record, nil
+}
+
+func captureRestoreRollbackEntry(root, path string) (restoreRollbackEntry, error) {
+	if err := validateRestoreTargetPath(root, path); err != nil {
+		return restoreRollbackEntry{}, err
+	}
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		createdDirs, dirErr := missingParentDirs(root, path)
+		if dirErr != nil {
+			return restoreRollbackEntry{}, dirErr
+		}
+		return restoreRollbackEntry{Path: path, Root: root, CreatedDirs: createdDirs}, nil
+	}
+	if err != nil {
+		return restoreRollbackEntry{}, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return restoreRollbackEntry{}, errUnsafePath
+	}
+	if !info.Mode().IsRegular() {
+		return restoreRollbackEntry{}, errUnsafePath
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return restoreRollbackEntry{}, err
+	}
+	return restoreRollbackEntry{Path: path, Root: root, Exists: true, Content: content, Mode: info.Mode().Perm()}, nil
+}
+
+func rollbackRestore(entries []restoreRollbackEntry) error {
+	for i := len(entries) - 1; i >= 0; i-- {
+		entry := entries[i]
+		if err := validateRestoreTargetPath(entry.Root, entry.Path); err != nil {
+			return err
+		}
+		if entry.Exists {
+			if err := atomicWriteFile(entry.Path, entry.Content, entry.Mode); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := os.Remove(entry.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		for _, dir := range entry.CreatedDirs {
+			if err := os.Remove(dir); err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ENOTEMPTY) && !errors.Is(err, syscall.EEXIST) {
+				return err
+			}
+		}
+		if err := syncDir(filepath.Dir(entry.Path)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+func missingParentDirs(root, targetPath string) ([]string, error) {
+	rootPath, err := filepath.Abs(root)
+	if err != nil {
+		return nil, err
+	}
+	current, err := filepath.Abs(filepath.Dir(targetPath))
+	if err != nil {
+		return nil, err
+	}
+	dirs := []string{}
+	for pathIsInsideRoot(rootPath, current) && current != rootPath {
+		info, err := os.Lstat(current)
+		if err == nil {
+			if info.Mode()&os.ModeSymlink != 0 {
+				return nil, errUnsafePath
+			}
+			if !info.IsDir() {
+				return nil, errUnsafePath
+			}
+			break
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		dirs = append(dirs, current)
+		next := filepath.Dir(current)
+		if next == current {
+			break
+		}
+		current = next
+	}
+	return dirs, nil
+}
+
+func (s siteService) validateRestoreArchive(files []*zip.File) error {
+	for _, file := range files {
+		if err := validateBackupEntryName(file.Name); err != nil {
+			return err
+		}
+		if file.FileInfo().Mode()&os.ModeSymlink != 0 {
+			return errUnsafePath
+		}
+		if file.FileInfo().IsDir() {
+			continue
+		}
+		targetPath, ok, err := s.restoreTargetForArchiveName(file.Name)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		root, err := s.restoreRootForArchiveName(file.Name)
+		if err != nil {
+			return err
+		}
+		if err := validateRestoreTargetPath(root, targetPath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s siteService) collectRestoreTargets(files []*zip.File) ([]restoreTarget, error) {
+	targets := []restoreTarget{}
+	seen := map[string]string{}
+	for _, file := range files {
+		if file.FileInfo().IsDir() || file.Name == "sitebrush-backup.json" {
+			continue
+		}
+		targetPath, ok, err := s.restoreTargetForArchiveName(file.Name)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		root, err := s.restoreRootForArchiveName(file.Name)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateRestoreTargetPath(root, targetPath); err != nil {
+			return nil, err
+		}
+		cleanTarget := filepath.Clean(targetPath)
+		if previous, exists := seen[cleanTarget]; exists {
+			return nil, fmt.Errorf("duplicate restore target %q and %q", previous, file.Name)
+		}
+		seen[cleanTarget] = file.Name
+		targets = append(targets, restoreTarget{
+			ArchiveName: file.Name,
+			Path:        targetPath,
+			Root:        root,
+			File:        file,
+		})
+	}
+	return targets, nil
+}
+
+func validateBackupEntryName(name string) error {
+	if name == "" || strings.Contains(name, `\`) || strings.Contains(name, "\x00") {
+		return errUnsafePath
+	}
+	if pathpkg.IsAbs(name) || filepath.IsAbs(name) || filepath.VolumeName(name) != "" {
+		return errUnsafePath
+	}
+	cleaned := pathpkg.Clean(name)
+	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return errUnsafePath
+	}
+	if cleaned != strings.TrimSuffix(name, "/") {
+		return errUnsafePath
+	}
+	return nil
+}
+
+func validateRestoreTargetPath(root, targetPath string) error {
+	rootPath, err := filepath.Abs(root)
+	if err != nil {
+		return err
+	}
+	targetAbs, err := filepath.Abs(targetPath)
+	if err != nil {
+		return err
+	}
+	if !pathIsInsideRoot(rootPath, targetAbs) {
+		return errUnsafePath
+	}
+	if err := rejectSymlinkComponents(rootPath, targetAbs); err != nil {
+		return err
+	}
+	evaluatedRoot, err := filepath.EvalSymlinks(rootPath)
+	if err != nil {
+		return err
+	}
+	existingParent, err := nearestExistingParent(filepath.Dir(targetAbs))
+	if err != nil {
+		return err
+	}
+	evaluatedParent, err := filepath.EvalSymlinks(existingParent)
+	if err != nil {
+		return err
+	}
+	if !pathIsInsideRoot(evaluatedRoot, evaluatedParent) {
+		return errUnsafePath
+	}
+	return nil
+}
+
+func rejectSymlinkComponents(rootPath, targetAbs string) error {
+	current := rootPath
+	for {
+		info, err := os.Lstat(current)
+		if errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return errUnsafePath
+		}
+		if current == targetAbs {
+			return nil
+		}
+		relative, err := filepath.Rel(current, targetAbs)
+		if err != nil {
+			return err
+		}
+		if relative == "." {
+			return nil
+		}
+		nextName := strings.Split(relative, string(filepath.Separator))[0]
+		if nextName == "" || nextName == "." || nextName == ".." {
+			return errUnsafePath
+		}
+		next := filepath.Join(current, nextName)
+		if next == current {
+			return errUnsafePath
+		}
+		current = next
+	}
+	return nil
+}
+
+func nearestExistingParent(path string) (string, error) {
+	current, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	for {
+		if _, err := os.Lstat(current); err == nil {
+			return current, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		next := filepath.Dir(current)
+		if next == current {
+			return "", os.ErrNotExist
+		}
+		current = next
+	}
+}
+
+func (s siteService) restoreTargetForArchiveName(name string) (string, bool, error) {
+	if err := validateBackupEntryName(name); err != nil {
+		return "", false, err
+	}
+	switch {
+	case strings.HasPrefix(name, "web/"):
+		relativePath := strings.TrimPrefix(name, "web/")
+		targetPath, err := safeJoinUnderRoot(s.config.WEB_FILE_PATH, filepath.FromSlash(relativePath))
+		return targetPath, true, err
+	case name == "archive/site-state.json":
+		return s.statePath(), true, nil
+	case name == "archive/redirects.json":
+		return s.redirectsPath(), true, nil
+	case strings.HasPrefix(name, "archive/metadata/"),
+		strings.HasPrefix(name, "archive/templates/"),
+		strings.HasPrefix(name, "archive/domains/") && strings.Contains(name, "/media/"),
+		strings.HasPrefix(name, "archive/domains/") && strings.Contains(name, "/media-metadata/"):
+		relativePath := strings.TrimPrefix(name, "archive/")
+		targetPath, err := safeJoinUnderRoot(s.archiveRoot(), filepath.FromSlash(relativePath))
+		return targetPath, true, err
+	default:
+		return "", false, nil
+	}
+}
+
+func (s siteService) restoreRootForArchiveName(name string) (string, error) {
+	if err := validateBackupEntryName(name); err != nil {
+		return "", err
+	}
+	switch {
+	case strings.HasPrefix(name, "web/"):
+		return s.config.WEB_FILE_PATH, nil
+	case name == "archive/site-state.json",
+		name == "archive/redirects.json",
+		strings.HasPrefix(name, "archive/metadata/"),
+		strings.HasPrefix(name, "archive/templates/"),
+		strings.HasPrefix(name, "archive/domains/") && strings.Contains(name, "/media/"),
+		strings.HasPrefix(name, "archive/domains/") && strings.Contains(name, "/media-metadata/"):
+		return s.archiveRoot(), nil
+	default:
+		return "", errUnsafePath
+	}
+}
+
+func restoreZipFile(file *zip.File, root, targetPath string) error {
+	if file.FileInfo().Mode()&os.ModeSymlink != 0 {
+		return errUnsafePath
+	}
+	if err := validateRestoreTargetPath(root, targetPath); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+		return err
+	}
+	if err := validateRestoreTargetPath(root, targetPath); err != nil {
+		return err
+	}
+	reader, err := file.Open()
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+	content, err := io.ReadAll(reader)
+	if err != nil {
+		return err
+	}
+	mode := file.FileInfo().Mode().Perm()
+	if mode == 0 {
+		mode = 0o644
+	}
+	if err := validateRestoreTargetPath(root, targetPath); err != nil {
+		return err
+	}
+	return atomicWriteFile(targetPath, content, mode)
 }
 
 func fileChecksum(path string) (string, int64, error) {

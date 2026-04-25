@@ -3,6 +3,7 @@
 package webserver
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -23,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -2207,6 +2209,361 @@ func TestFreezeAndBackupPersistOutsideWebRoot(t *testing.T) {
 	}
 	if backupCount != 1 {
 		t.Fatalf("backup table records = %d, want 1", backupCount)
+	}
+}
+
+func TestFreezeServesPublishedSnapshotToAnonymousVisitors(t *testing.T) {
+	cfg, cookie, csrf := loginTestUser(t)
+	writeFixtureFile(t, cfg.WEB_FILE_PATH, "index.html", "published")
+
+	postAction(t, cfg, cookie, "/?freeze", url.Values{"csrf": {csrf}}, http.StatusOK)
+
+	anonRec := httptest.NewRecorder()
+	handleRequest(cfg, anonRec, httptest.NewRequest(http.MethodGet, "/", nil))
+	anonBody, _ := io.ReadAll(anonRec.Result().Body)
+	if string(anonBody) != "published" {
+		t.Fatalf("anonymous frozen body = %q, want published snapshot", string(anonBody))
+	}
+
+	editForm := url.Values{"csrf": {csrf}, "content": {"draft"}}
+	postAction(t, cfg, cookie, "/?edit", editForm, http.StatusSeeOther)
+
+	authReq := httptest.NewRequest(http.MethodGet, "/", nil)
+	authReq.AddCookie(cookie)
+	authRec := httptest.NewRecorder()
+	handleRequest(cfg, authRec, authReq)
+	authBody, _ := io.ReadAll(authRec.Result().Body)
+	if string(authBody) != "draft" {
+		t.Fatalf("authenticated frozen body = %q, want draft from working tree", string(authBody))
+	}
+
+	anonRec = httptest.NewRecorder()
+	handleRequest(cfg, anonRec, httptest.NewRequest(http.MethodGet, "/", nil))
+	anonBody, _ = io.ReadAll(anonRec.Result().Body)
+	if string(anonBody) != "published" {
+		t.Fatalf("anonymous body after frozen edit = %q, want unchanged published snapshot", string(anonBody))
+	}
+
+	postAction(t, cfg, cookie, "/?unfreeze", url.Values{"csrf": {csrf}}, http.StatusOK)
+	anonRec = httptest.NewRecorder()
+	handleRequest(cfg, anonRec, httptest.NewRequest(http.MethodGet, "/", nil))
+	anonBody, _ = io.ReadAll(anonRec.Result().Body)
+	if string(anonBody) != "draft" {
+		t.Fatalf("anonymous body after unfreeze = %q, want republished draft", string(anonBody))
+	}
+}
+
+func TestFreezeServesPublishedMediaSnapshotToAnonymousVisitors(t *testing.T) {
+	cfg, cookie, csrf := loginTestUser(t)
+	service := newSiteService(cfg)
+	roots, err := service.domainPaths("example.com")
+	if err != nil {
+		t.Fatalf("domain paths: %v", err)
+	}
+	writeFixtureFile(t, cfg.WEB_FILE_PATH, "index.html", "published")
+	writeFixtureFile(t, roots.MediaRoot, "asset.txt", "published media")
+
+	postAction(t, cfg, cookie, "/?freeze", url.Values{"csrf": {csrf}}, http.StatusOK)
+	writeFixtureFile(t, roots.MediaRoot, "asset.txt", "draft media")
+
+	anonReq := httptest.NewRequest(http.MethodGet, "/f/asset.txt", nil)
+	anonReq.Host = "example.com"
+	anonRec := httptest.NewRecorder()
+	handleRequest(cfg, anonRec, anonReq)
+	anonBody, _ := io.ReadAll(anonRec.Result().Body)
+	if string(anonBody) != "published media" {
+		t.Fatalf("anonymous frozen media = %q, want published media snapshot", string(anonBody))
+	}
+
+	authReq := httptest.NewRequest(http.MethodGet, "/f/asset.txt", nil)
+	authReq.Host = "example.com"
+	authReq.AddCookie(cookie)
+	authRec := httptest.NewRecorder()
+	handleRequest(cfg, authRec, authReq)
+	authBody, _ := io.ReadAll(authRec.Result().Body)
+	if string(authBody) != "draft media" {
+		t.Fatalf("authenticated frozen media = %q, want draft live media", string(authBody))
+	}
+
+	postAction(t, cfg, cookie, "/?unfreeze", url.Values{"csrf": {csrf}}, http.StatusOK)
+	anonReq = httptest.NewRequest(http.MethodGet, "/f/asset.txt", nil)
+	anonReq.Host = "example.com"
+	anonRec = httptest.NewRecorder()
+	handleRequest(cfg, anonRec, anonReq)
+	anonBody, _ = io.ReadAll(anonRec.Result().Body)
+	if string(anonBody) != "draft media" {
+		t.Fatalf("anonymous media after unfreeze = %q, want live draft media", string(anonBody))
+	}
+}
+
+func TestBackupIncludesWebAndSafeMetadata(t *testing.T) {
+	cfg, cookie, csrf := loginTestUser(t)
+	writeFixtureFile(t, cfg.WEB_FILE_PATH, "index.html", "home page")
+	service := newSiteService(cfg)
+	if err := service.writePageMetadata(pageMetadata{Path: "/", Title: "Home", Status: "active", Published: true}); err != nil {
+		t.Fatalf("write page metadata: %v", err)
+	}
+	if err := service.writeSiteState(siteState{Frozen: true, UpdatedAt: time.Now().UTC()}); err != nil {
+		t.Fatalf("write site state: %v", err)
+	}
+	if err := service.saveRedirect(Data.Redirect{OldUri: "/old.html", NewUri: "/", Status: "active", Domain: defaultDBDomain}); err != nil {
+		t.Fatalf("write redirect: %v", err)
+	}
+	metadataRel, err := filepath.Rel(service.archiveRoot(), service.metadataPath("/"))
+	if err != nil {
+		t.Fatalf("metadata rel: %v", err)
+	}
+	roots, err := service.domainPaths("example.com")
+	if err != nil {
+		t.Fatalf("domain paths: %v", err)
+	}
+	writeFixtureFile(t, roots.MediaRoot, "asset.txt", "media")
+
+	backupRec := postAction(t, cfg, cookie, "/?backup", url.Values{"csrf": {csrf}}, http.StatusOK)
+	var record backupRecord
+	if err := json.NewDecoder(backupRec.Result().Body).Decode(&record); err != nil {
+		t.Fatalf("decode backup response: %v", err)
+	}
+	names := zipEntryNames(t, record.Path)
+	for _, want := range []string{
+		"sitebrush-backup.json",
+		"web/index.html",
+		"archive/site-state.json",
+		"archive/redirects.json",
+		"archive/" + filepath.ToSlash(metadataRel),
+		"archive/domains/example.com/media/asset.txt",
+	} {
+		if !names[want] {
+			t.Fatalf("backup entries missing %q; got %v", want, sortedZipNames(names))
+		}
+	}
+	for name := range names {
+		if strings.Contains(strings.ToLower(name), "user") || strings.Contains(strings.ToLower(name), "auth") {
+			t.Fatalf("backup unexpectedly included auth/user-looking entry %q", name)
+		}
+	}
+}
+
+func TestBackupRejectsArchiveRootSymlinkInsideWebRoot(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires elevated privileges on many Windows environments")
+	}
+
+	cfg, _, _ := loginTestUser(t)
+	service := newSiteService(cfg)
+	archiveRoot := service.archiveRoot()
+	if err := os.MkdirAll(filepath.Dir(archiveRoot), 0o755); err != nil {
+		t.Fatalf("create archive parent: %v", err)
+	}
+	insideWebRoot := filepath.Join(cfg.WEB_FILE_PATH, "public-backups")
+	if err := os.MkdirAll(insideWebRoot, 0o755); err != nil {
+		t.Fatalf("create public backup target: %v", err)
+	}
+	if err := os.Symlink(insideWebRoot, archiveRoot); err != nil {
+		t.Skipf("cannot create symlink in this environment: %v", err)
+	}
+
+	if record, err := service.createBackup(); err == nil {
+		t.Fatalf("createBackup() = %+v, nil error; want symlink destination rejection", record)
+	}
+}
+
+func TestBackupCreatesUniqueSameSecondArchives(t *testing.T) {
+	cfg, _, _ := loginTestUser(t)
+	writeFixtureFile(t, cfg.WEB_FILE_PATH, "index.html", "home page")
+	service := newSiteService(cfg)
+
+	first, err := service.createBackup()
+	if err != nil {
+		t.Fatalf("first backup: %v", err)
+	}
+	second, err := service.createBackup()
+	if err != nil {
+		t.Fatalf("second backup: %v", err)
+	}
+	if first.Path == second.Path {
+		t.Fatalf("backup paths are identical for same-second backups: %q", first.Path)
+	}
+	for _, path := range []string{first.Path, second.Path} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("backup archive %q missing: %v", path, err)
+		}
+	}
+}
+
+func TestRestoreRejectsZipTraversalEntries(t *testing.T) {
+	cfg, cookie, csrf := loginTestUser(t)
+	service := newSiteService(cfg)
+	backupDir := filepath.Join(service.archiveRoot(), "backups")
+	if err := os.MkdirAll(backupDir, 0o755); err != nil {
+		t.Fatalf("create backup dir: %v", err)
+	}
+	archivePath := filepath.Join(backupDir, "malicious.zip")
+	createZipFixture(t, archivePath, map[string]string{
+		"web/index.html": "safe",
+		"../escape.html": "bad",
+	})
+
+	rec := postAction(t, cfg, cookie, "/?backup", url.Values{
+		"csrf":    {csrf},
+		"restore": {"1"},
+		"path":    {archivePath},
+	}, http.StatusForbidden)
+	body, _ := io.ReadAll(rec.Result().Body)
+	if !strings.Contains(string(body), "Forbidden") {
+		t.Fatalf("restore body = %q, want forbidden", string(body))
+	}
+	if _, err := os.Stat(filepath.Join(cfg.WEB_FILE_PATH, "index.html")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("restore wrote web/index.html before rejecting traversal: %v", err)
+	}
+}
+
+func TestRestoreRejectsSymlinkTargetsAndParents(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires elevated privileges on many Windows environments")
+	}
+
+	t.Run("target", func(t *testing.T) {
+		cfg, cookie, csrf := loginTestUser(t)
+		service := newSiteService(cfg)
+		backupDir := filepath.Join(service.archiveRoot(), "backups")
+		if err := os.MkdirAll(backupDir, 0o755); err != nil {
+			t.Fatalf("create backup dir: %v", err)
+		}
+		archivePath := filepath.Join(backupDir, "restore-target-symlink.zip")
+		createZipFixture(t, archivePath, map[string]string{
+			"web/index.html": "restored",
+		})
+		outside := t.TempDir()
+		outsideFile := filepath.Join(outside, "index.html")
+		if err := os.WriteFile(outsideFile, []byte("outside"), 0o644); err != nil {
+			t.Fatalf("write outside file: %v", err)
+		}
+		if err := os.Symlink(outsideFile, filepath.Join(cfg.WEB_FILE_PATH, "index.html")); err != nil {
+			t.Skipf("cannot create symlink in this environment: %v", err)
+		}
+
+		postAction(t, cfg, cookie, "/?backup", url.Values{
+			"csrf":    {csrf},
+			"restore": {"1"},
+			"path":    {archivePath},
+		}, http.StatusForbidden)
+		outsideBody, err := os.ReadFile(outsideFile)
+		if err != nil {
+			t.Fatalf("read outside file: %v", err)
+		}
+		if string(outsideBody) != "outside" {
+			t.Fatalf("outside file changed through symlink target: %q", string(outsideBody))
+		}
+	})
+
+	t.Run("parent", func(t *testing.T) {
+		cfg, cookie, csrf := loginTestUser(t)
+		service := newSiteService(cfg)
+		backupDir := filepath.Join(service.archiveRoot(), "backups")
+		if err := os.MkdirAll(backupDir, 0o755); err != nil {
+			t.Fatalf("create backup dir: %v", err)
+		}
+		archivePath := filepath.Join(backupDir, "restore-parent-symlink.zip")
+		createZipFixture(t, archivePath, map[string]string{
+			"web/nested/index.html": "restored",
+		})
+		outside := t.TempDir()
+		if err := os.Symlink(outside, filepath.Join(cfg.WEB_FILE_PATH, "nested")); err != nil {
+			t.Skipf("cannot create symlink in this environment: %v", err)
+		}
+
+		postAction(t, cfg, cookie, "/?backup", url.Values{
+			"csrf":    {csrf},
+			"restore": {"1"},
+			"path":    {archivePath},
+		}, http.StatusForbidden)
+		if _, err := os.Stat(filepath.Join(outside, "index.html")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("restore wrote through symlink parent: %v", err)
+		}
+	})
+}
+
+func TestRestoreRollbackRemovesCreatedDirectoriesAfterLateFailure(t *testing.T) {
+	cfg, _, _ := loginTestUser(t)
+	cfg.DB_TYPE = "sqlite"
+	cfg.DB_FULL_FILE_PATH = t.TempDir()
+	service := newSiteService(cfg)
+	backupDir := filepath.Join(service.archiveRoot(), "backups")
+	if err := os.MkdirAll(backupDir, 0o755); err != nil {
+		t.Fatalf("create backup dir: %v", err)
+	}
+	archivePath := filepath.Join(backupDir, "late-failure.zip")
+	createZipFixture(t, archivePath, map[string]string{
+		"web/new/deep/page.html": "restored",
+	})
+
+	if record, err := service.restoreBackup(archivePath); err == nil {
+		t.Fatalf("restoreBackup() = %+v, nil error; want DB record failure", record)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.WEB_FILE_PATH, "new")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rollback left created directory behind: %v", err)
+	}
+}
+
+func postAction(t *testing.T, cfg Config.Settings, cookie *http.Cookie, target string, form url.Values, wantStatus int) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, target, strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	handleRequest(cfg, rec, req)
+	if rec.Result().StatusCode != wantStatus {
+		body, _ := io.ReadAll(rec.Result().Body)
+		t.Fatalf("POST %s status = %d body = %q, want %d", target, rec.Result().StatusCode, string(body), wantStatus)
+	}
+	return rec
+}
+
+func zipEntryNames(t *testing.T, archivePath string) map[string]bool {
+	t.Helper()
+	reader, err := zip.OpenReader(archivePath)
+	if err != nil {
+		t.Fatalf("open zip: %v", err)
+	}
+	defer reader.Close()
+	names := map[string]bool{}
+	for _, file := range reader.File {
+		names[file.Name] = true
+	}
+	return names
+}
+
+func sortedZipNames(names map[string]bool) []string {
+	values := make([]string, 0, len(names))
+	for name := range names {
+		values = append(values, name)
+	}
+	sort.Strings(values)
+	return values
+}
+
+func createZipFixture(t *testing.T, archivePath string, entries map[string]string) {
+	t.Helper()
+	file, err := os.Create(archivePath)
+	if err != nil {
+		t.Fatalf("create zip: %v", err)
+	}
+	writer := zip.NewWriter(file)
+	for name, body := range entries {
+		entryWriter, err := writer.Create(name)
+		if err != nil {
+			t.Fatalf("create zip entry: %v", err)
+		}
+		if _, err := entryWriter.Write([]byte(body)); err != nil {
+			t.Fatalf("write zip entry: %v", err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close zip writer: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close zip file: %v", err)
 	}
 }
 
