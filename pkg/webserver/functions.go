@@ -42,9 +42,12 @@ type siteService struct {
 }
 
 type operatorSession struct {
-	User      string
-	CSRFToken string
-	ExpiresAt time.Time
+	User       string
+	Email      string
+	UserID     int64
+	AuthSource string
+	CSRFToken  string
+	ExpiresAt  time.Time
 }
 
 type sessionStore struct {
@@ -97,6 +100,10 @@ func checkUserLoggedIn(request *http.Request) bool {
 }
 
 func (s *sessionStore) create(responseWriter http.ResponseWriter, request *http.Request, user string) (operatorSession, error) {
+	return s.createForUser(responseWriter, request, user, "", 0, "env")
+}
+
+func (s *sessionStore) createForUser(responseWriter http.ResponseWriter, request *http.Request, user, email string, userID int64, authSource string) (operatorSession, error) {
 	token, err := randomToken(32)
 	if err != nil {
 		return operatorSession{}, err
@@ -107,9 +114,12 @@ func (s *sessionStore) create(responseWriter http.ResponseWriter, request *http.
 	}
 
 	session := operatorSession{
-		User:      user,
-		CSRFToken: csrfToken,
-		ExpiresAt: time.Now().Add(sessionDuration),
+		User:       user,
+		Email:      email,
+		UserID:     userID,
+		AuthSource: authSource,
+		CSRFToken:  csrfToken,
+		ExpiresAt:  time.Now().Add(sessionDuration),
 	}
 
 	s.mu.Lock()
@@ -214,22 +224,50 @@ func (s siteService) login(responseWriter http.ResponseWriter, request *http.Req
 	case http.MethodGet:
 		status := http.StatusOK
 		message := ""
-		if !adminPasswordConfigured() {
+		hasPersistentUsers, err := s.hasPersistentUsers()
+		if err != nil {
+			status = http.StatusInternalServerError
+			message = "Could not load user store."
+		} else if !hasPersistentUsers && !adminPasswordConfigured() {
 			status = http.StatusServiceUnavailable
 			message = "Admin password is not configured. Set SITEBRUSH_ADMIN_PASSWORD_SHA256 or SITEBRUSH_ADMIN_PASSWORD."
 		}
 		responseWriter.WriteHeader(status)
 		renderHTML(responseWriter, "SiteBrush Login", loginFormTemplate, map[string]string{"Message": message})
 	case http.MethodPost:
-		if !adminPasswordConfigured() {
-			http.Error(responseWriter, "Admin password is not configured", http.StatusServiceUnavailable)
-			return
-		}
 		if err := request.ParseForm(); err != nil {
 			http.Error(responseWriter, "Invalid login request", http.StatusBadRequest)
 			return
 		}
-		if !validateAdminPassword(request.FormValue("password")) {
+		password := request.FormValue("password")
+		email := normalizeEmail(request.FormValue("email"))
+		hasPersistentUsers, err := s.hasPersistentUsers()
+		if err != nil {
+			http.Error(responseWriter, "Could not load user store", http.StatusInternalServerError)
+			return
+		}
+		if hasPersistentUsers && email != "" {
+			user, ok, err := s.authenticatePersistentUser(email, password)
+			if err != nil {
+				http.Error(responseWriter, "Could not authenticate", http.StatusInternalServerError)
+				return
+			}
+			if ok {
+				if _, err := s.sessions.createForUser(responseWriter, request, displayUserName(user), user.Email, user.Id, "persistent"); err != nil {
+					http.Error(responseWriter, "Could not create session", http.StatusInternalServerError)
+					return
+				}
+				redirectAfterLogin(responseWriter, request)
+				return
+			}
+			http.Error(responseWriter, "Invalid credentials", http.StatusUnauthorized)
+			return
+		}
+		if !adminPasswordConfigured() {
+			http.Error(responseWriter, "Invalid credentials", http.StatusUnauthorized)
+			return
+		}
+		if !validateAdminPassword(password) {
 			http.Error(responseWriter, "Invalid credentials", http.StatusUnauthorized)
 			return
 		}
@@ -237,15 +275,19 @@ func (s siteService) login(responseWriter http.ResponseWriter, request *http.Req
 			http.Error(responseWriter, "Could not create session", http.StatusInternalServerError)
 			return
 		}
-		next := request.FormValue("next")
-		if next == "" || strings.HasPrefix(next, "//") || !strings.HasPrefix(next, "/") {
-			next = "/?profile"
-		}
-		http.Redirect(responseWriter, request, next, http.StatusSeeOther)
+		redirectAfterLogin(responseWriter, request)
 	default:
 		responseWriter.Header().Set("Allow", "GET, POST")
 		http.Error(responseWriter, "Method Not Allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func redirectAfterLogin(responseWriter http.ResponseWriter, request *http.Request) {
+	next := request.FormValue("next")
+	if next == "" || strings.HasPrefix(next, "//") || !strings.HasPrefix(next, "/") {
+		next = "/?profile"
+	}
+	http.Redirect(responseWriter, request, next, http.StatusSeeOther)
 }
 
 // editFunction обрабатывает запросы на редактирование файла.
@@ -568,6 +610,8 @@ func (s siteService) profile(responseWriter http.ResponseWriter, request *http.R
 	case http.MethodGet:
 		renderHTML(responseWriter, "Profile", profileTemplate, map[string]string{
 			"User":    session.User,
+			"Email":   session.Email,
+			"Source":  session.AuthSource,
 			"Expires": session.ExpiresAt.Format(time.RFC3339),
 			"Site":    s.config.WEB_FILE_PATH,
 			"CSRF":    session.CSRFToken,
@@ -577,7 +621,33 @@ func (s siteService) profile(responseWriter http.ResponseWriter, request *http.R
 			http.Error(responseWriter, "Forbidden", http.StatusForbidden)
 			return
 		}
-		http.Error(responseWriter, "Profile updates are not implemented yet", http.StatusNotImplemented)
+		if session.AuthSource != "persistent" || session.UserID == 0 {
+			http.Error(responseWriter, "Profile updates for environment admin sessions are not implemented yet", http.StatusNotImplemented)
+			return
+		}
+		if err := request.ParseForm(); err != nil {
+			http.Error(responseWriter, "Invalid profile request", http.StatusBadRequest)
+			return
+		}
+		currentPassword := request.FormValue("current_password")
+		newPassword := request.FormValue("new_password")
+		if currentPassword == "" || newPassword == "" {
+			http.Error(responseWriter, "Missing password fields", http.StatusBadRequest)
+			return
+		}
+		if err := s.changePersistentPassword(session.UserID, currentPassword, newPassword); err != nil {
+			if errors.Is(err, errInvalidCredentials) {
+				http.Error(responseWriter, "Invalid credentials", http.StatusUnauthorized)
+				return
+			}
+			if errors.Is(err, errWeakPassword) {
+				http.Error(responseWriter, "New password is too weak", http.StatusBadRequest)
+				return
+			}
+			http.Error(responseWriter, "Could not update profile", http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprint(responseWriter, "Password changed")
 	default:
 		responseWriter.Header().Set("Allow", "GET, POST")
 		http.Error(responseWriter, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -945,7 +1015,11 @@ func (s siteService) handle(responseWriter http.ResponseWriter, request *http.Re
 		s.profile(responseWriter, request)
 	case "logout":
 		s.logout(responseWriter, request)
-	case "join", "verify", "recover", "captcha":
+	case "join":
+		s.join(responseWriter, request)
+	case "recover":
+		s.recover(responseWriter, request)
+	case "verify", "captcha":
 		s.notImplementedPublic(responseWriter, request, action)
 	case "upload", "grab", "domains", "undelete":
 		s.notImplementedMutation(responseWriter, request, action)
@@ -1330,8 +1404,17 @@ func renderHTML(responseWriter http.ResponseWriter, title, body string, data any
 const loginFormTemplate = `
 {{with .Data.Message}}<p>{{.}}</p>{{end}}
 <form method="post" action="/?login">
+  <label>Email <input type="email" name="email" autocomplete="username"></label>
   <label>Password <input type="password" name="password" autocomplete="current-password"></label>
   <button type="submit">Log in</button>
+</form>`
+
+const joinFormTemplate = `
+<p>Create the first persistent SiteBrush administrator. This form is available only while no persistent users exist.</p>
+<form method="post" action="/?join">
+  <label>Email <input type="email" name="email" autocomplete="username" required></label>
+  <label>Password <input type="password" name="password" autocomplete="new-password" minlength="8" required></label>
+  <button type="submit">Create admin</button>
 </form>`
 
 const editFormTemplate = `
@@ -1361,8 +1444,21 @@ const propertiesTemplate = `
 
 const profileTemplate = `
 <p>User: {{.Data.User}}</p>
+{{with .Data.Email}}<p>Email: {{.}}</p>{{end}}
+<p>Auth source: {{.Data.Source}}</p>
 <p>Session expires: {{.Data.Expires}}</p>
-<p>Site root: {{.Data.Site}}</p>`
+<p>Site root: {{.Data.Site}}</p>
+{{if eq .Data.Source "persistent"}}
+<h2>Change password</h2>
+<form method="post" action="/?profile">
+  <input type="hidden" name="csrf" value="{{.Data.CSRF}}">
+  <label>Current password <input type="password" name="current_password" autocomplete="current-password"></label>
+  <label>New password <input type="password" name="new_password" autocomplete="new-password" minlength="8"></label>
+  <button type="submit">Change password</button>
+</form>
+{{else}}
+<p>Environment admin profile changes are not implemented yet.</p>
+{{end}}`
 
 const logoutTemplate = `
 <form method="post" action="/?logout"><input type="hidden" name="csrf" value="{{.Data.CSRF}}"><button type="submit">Log out</button></form>`

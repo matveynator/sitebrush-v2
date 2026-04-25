@@ -13,7 +13,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	Config "sitebrush/pkg/config"
 )
@@ -380,13 +382,449 @@ func TestPlannedV1PublicActionsReturnNotImplemented(t *testing.T) {
 	writeFixtureFile(t, root, "index.html", "home page")
 	cfg := testConfig(t, root)
 
-	req := httptest.NewRequest(http.MethodGet, "/?join", nil)
+	req := httptest.NewRequest(http.MethodGet, "/?recover", nil)
 	rec := httptest.NewRecorder()
 
 	handleRequest(cfg, rec, req)
 
 	if rec.Result().StatusCode != http.StatusNotImplemented {
 		t.Fatalf("status = %d, want %d", rec.Result().StatusCode, http.StatusNotImplemented)
+	}
+}
+
+func TestPasswordHashVerifyUsesVersionedSaltedHash(t *testing.T) {
+	hash, err := hashPassword("correct horse battery staple")
+	if err != nil {
+		t.Fatalf("hashPassword() error = %v", err)
+	}
+	if !strings.HasPrefix(hash, passwordHashAlgorithm+"$v=1$i=") {
+		t.Fatalf("hash = %q, want versioned %s hash", hash, passwordHashAlgorithm)
+	}
+	if strings.Contains(hash, "correct") || strings.Contains(strings.ToLower(hash), "md5") {
+		t.Fatalf("hash leaks plaintext or legacy algorithm marker: %q", hash)
+	}
+	ok, err := verifyPassword("correct horse battery staple", hash)
+	if err != nil {
+		t.Fatalf("verifyPassword(correct) error = %v", err)
+	}
+	if !ok {
+		t.Fatalf("verifyPassword(correct) = false, want true")
+	}
+	ok, err = verifyPassword("wrong password", hash)
+	if err != nil {
+		t.Fatalf("verifyPassword(wrong) error = %v", err)
+	}
+	if ok {
+		t.Fatalf("verifyPassword(wrong) = true, want false")
+	}
+	if ok, err := verifyPassword("anything", "md5:legacy"); err == nil || ok {
+		t.Fatalf("verifyPassword(legacy) = %v, %v; want unsupported error", ok, err)
+	}
+}
+
+func TestPasswordHashVerifyRejectsExcessiveIterations(t *testing.T) {
+	corrupted := passwordHashAlgorithm + "$v=1$i=600001$s=ignored$h=ignored"
+	if ok, err := verifyPassword("anything", corrupted); err == nil || ok {
+		t.Fatalf("verifyPassword(excessive iterations) = %v, %v; want iteration cap error", ok, err)
+	}
+}
+
+func TestFirstJoinCreatesPersistentSuperuserAdmin(t *testing.T) {
+	defaultSessions = newSessionStore()
+	t.Setenv("SITEBRUSH_ADMIN_PASSWORD", "")
+	t.Setenv("SITEBRUSH_ADMIN_PASSWORD_SHA256", "")
+	root := t.TempDir()
+	cfg := testConfig(t, root)
+
+	getReq := httptest.NewRequest(http.MethodGet, "/?join", nil)
+	getRec := httptest.NewRecorder()
+	handleRequest(cfg, getRec, getReq)
+	if getRec.Result().StatusCode != http.StatusOK {
+		t.Fatalf("join GET status = %d, want %d", getRec.Result().StatusCode, http.StatusOK)
+	}
+
+	form := url.Values{"email": {"Admin@Example.test"}, "password": {"admin-password-1"}}
+	req := httptest.NewRequest(http.MethodPost, "/?join", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	handleRequest(cfg, rec, req)
+	if rec.Result().StatusCode != http.StatusSeeOther {
+		t.Fatalf("join POST status = %d, want %d", rec.Result().StatusCode, http.StatusSeeOther)
+	}
+	if len(rec.Result().Cookies()) == 0 {
+		t.Fatalf("join did not set a persistent session cookie")
+	}
+
+	service := siteService{config: cfg, sessions: defaultSessions}
+	store, err := service.loadAuthStore()
+	if err != nil {
+		t.Fatalf("load auth store: %v", err)
+	}
+	if len(store.Users) != 1 || store.Users[0].Email != "admin@example.test" {
+		t.Fatalf("users = %+v, want one normalized admin", store.Users)
+	}
+	if store.Users[0].PasswordHash == "" || strings.Contains(store.Users[0].PasswordHash, "admin-password-1") {
+		t.Fatalf("stored password hash is missing or unsafe: %q", store.Users[0].PasswordHash)
+	}
+	if len(store.Groups) != 1 || store.Groups[0].Name != superuserGroupName {
+		t.Fatalf("groups = %+v, want %s", store.Groups, superuserGroupName)
+	}
+	if len(store.UserGroups) != 1 || store.UserGroups[0].UserId != store.Users[0].Id || store.UserGroups[0].GroupId != store.Groups[0].Id {
+		t.Fatalf("user groups = %+v, want first admin in superuser group", store.UserGroups)
+	}
+	authDirInfo, err := os.Stat(filepath.Dir(service.authStorePath()))
+	if err != nil {
+		t.Fatalf("stat auth store dir: %v", err)
+	}
+	if authDirInfo.Mode().Perm() != 0o700 {
+		t.Fatalf("auth store dir mode = %o, want 0700", authDirInfo.Mode().Perm())
+	}
+}
+
+func TestDuplicateJoinBlockedAfterPersistentUserExists(t *testing.T) {
+	defaultSessions = newSessionStore()
+	root := t.TempDir()
+	cfg := testConfig(t, root)
+	service := siteService{config: cfg, sessions: defaultSessions}
+	if _, err := service.createFirstAdmin("admin@example.test", "admin-password-1"); err != nil {
+		t.Fatalf("create first admin: %v", err)
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, "/?join", nil)
+	getRec := httptest.NewRecorder()
+	handleRequest(cfg, getRec, getReq)
+	if getRec.Result().StatusCode != http.StatusForbidden {
+		t.Fatalf("duplicate join GET status = %d, want %d", getRec.Result().StatusCode, http.StatusForbidden)
+	}
+
+	form := url.Values{"email": {"other@example.test"}, "password": {"admin-password-2"}}
+	postReq := httptest.NewRequest(http.MethodPost, "/?join", strings.NewReader(form.Encode()))
+	postReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	postRec := httptest.NewRecorder()
+	handleRequest(cfg, postRec, postReq)
+	if postRec.Result().StatusCode != http.StatusForbidden {
+		t.Fatalf("duplicate join POST status = %d, want %d", postRec.Result().StatusCode, http.StatusForbidden)
+	}
+}
+
+func TestConcurrentFirstAdminCreateAllowsExactlyOneAdmin(t *testing.T) {
+	defaultSessions = newSessionStore()
+	root := t.TempDir()
+	cfg := testConfig(t, root)
+	service := siteService{config: cfg, sessions: defaultSessions}
+
+	const attempts = 12
+	start := make(chan struct{})
+	results := make(chan error, attempts)
+	var wg sync.WaitGroup
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, err := service.createFirstAdmin("admin@example.test", "admin-password-1")
+			results <- err
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	successes := 0
+	for err := range results {
+		if err == nil {
+			successes++
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("successful first-admin creates = %d, want 1", successes)
+	}
+
+	store, err := service.loadAuthStore()
+	if err != nil {
+		t.Fatalf("load auth store: %v", err)
+	}
+	if len(store.Users) != 1 || len(store.Groups) != 1 || len(store.UserGroups) != 1 {
+		t.Fatalf("store = %+v, want exactly one persisted user/admin membership", store)
+	}
+	if len(activeUsers(store.Users)) != 1 || store.Users[0].Email != "admin@example.test" {
+		t.Fatalf("users = %+v, want exactly one active persisted admin", store.Users)
+	}
+}
+
+func TestConcurrentFirstAdminJoinAllowsExactlyOneAdmin(t *testing.T) {
+	defaultSessions = newSessionStore()
+	t.Setenv("SITEBRUSH_ADMIN_PASSWORD", "")
+	t.Setenv("SITEBRUSH_ADMIN_PASSWORD_SHA256", "")
+	root := t.TempDir()
+	cfg := testConfig(t, root)
+
+	const attempts = 12
+	start := make(chan struct{})
+	results := make(chan int, attempts)
+	var wg sync.WaitGroup
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			form := url.Values{"email": {"admin@example.test"}, "password": {"admin-password-1"}}
+			req := httptest.NewRequest(http.MethodPost, "/?join", strings.NewReader(form.Encode()))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			rec := httptest.NewRecorder()
+			handleRequest(cfg, rec, req)
+			results <- rec.Result().StatusCode
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	successes := 0
+	for status := range results {
+		if status == http.StatusSeeOther {
+			successes++
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("successful first-admin joins = %d, want 1", successes)
+	}
+
+	service := siteService{config: cfg, sessions: defaultSessions}
+	store, err := service.loadAuthStore()
+	if err != nil {
+		t.Fatalf("load auth store: %v", err)
+	}
+	if len(store.Users) != 1 || len(store.Groups) != 1 || len(store.UserGroups) != 1 {
+		t.Fatalf("store = %+v, want exactly one persisted user/admin membership", store)
+	}
+}
+
+func TestLoginWithPersistentAdmin(t *testing.T) {
+	cfg, cookie, _, session := loginPersistentTestUser(t, "admin-password-1")
+	if session.AuthSource != "persistent" || session.Email != "admin@example.test" || session.UserID == 0 {
+		t.Fatalf("session = %+v, want persistent admin session", session)
+	}
+
+	profileReq := httptest.NewRequest(http.MethodGet, "/?profile", nil)
+	profileReq.AddCookie(cookie)
+	profileRec := httptest.NewRecorder()
+	handleRequest(cfg, profileRec, profileReq)
+	body, err := io.ReadAll(profileRec.Result().Body)
+	if err != nil {
+		t.Fatalf("read profile body: %v", err)
+	}
+	if profileRec.Result().StatusCode != http.StatusOK || !strings.Contains(string(body), "admin@example.test") {
+		t.Fatalf("profile status/body = %d/%q, want persistent user email", profileRec.Result().StatusCode, string(body))
+	}
+}
+
+func TestPersistentLoginWithEmailDoesNotFallThroughToEnvAdmin(t *testing.T) {
+	defaultSessions = newSessionStore()
+	t.Setenv("SITEBRUSH_ADMIN_PASSWORD", "env-secret")
+	t.Setenv("SITEBRUSH_ADMIN_PASSWORD_SHA256", "")
+	root := t.TempDir()
+	cfg := testConfig(t, root)
+	service := siteService{config: cfg, sessions: defaultSessions}
+	if _, err := service.createFirstAdmin("admin@example.test", "persistent-secret"); err != nil {
+		t.Fatalf("create first admin: %v", err)
+	}
+
+	for _, email := range []string{"admin@example.test", "other@example.test"} {
+		t.Run(email, func(t *testing.T) {
+			form := url.Values{"email": {email}, "password": {"env-secret"}}
+			req := httptest.NewRequest(http.MethodPost, "/?login", strings.NewReader(form.Encode()))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			rec := httptest.NewRecorder()
+
+			handleRequest(cfg, rec, req)
+
+			if rec.Result().StatusCode != http.StatusUnauthorized {
+				t.Fatalf("login status = %d, want %d", rec.Result().StatusCode, http.StatusUnauthorized)
+			}
+			if cookies := rec.Result().Cookies(); len(cookies) != 0 {
+				t.Fatalf("login set cookies %+v; want none", cookies)
+			}
+		})
+	}
+}
+
+func TestEnvAdminFallbackWithPersistentUsersRequiresOmittedEmail(t *testing.T) {
+	defaultSessions = newSessionStore()
+	t.Setenv("SITEBRUSH_ADMIN_PASSWORD", "env-secret")
+	t.Setenv("SITEBRUSH_ADMIN_PASSWORD_SHA256", "")
+	root := t.TempDir()
+	cfg := testConfig(t, root)
+	service := siteService{config: cfg, sessions: defaultSessions}
+	if _, err := service.createFirstAdmin("admin@example.test", "persistent-secret"); err != nil {
+		t.Fatalf("create first admin: %v", err)
+	}
+
+	form := url.Values{"password": {"env-secret"}}
+	req := httptest.NewRequest(http.MethodPost, "/?login", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+
+	handleRequest(cfg, rec, req)
+
+	if rec.Result().StatusCode != http.StatusSeeOther {
+		t.Fatalf("login status = %d, want %d", rec.Result().StatusCode, http.StatusSeeOther)
+	}
+	cookies := rec.Result().Cookies()
+	if len(cookies) == 0 {
+		t.Fatalf("env fallback did not set a session cookie")
+	}
+	sessionReq := httptest.NewRequest(http.MethodGet, "/?profile", nil)
+	sessionReq.AddCookie(cookies[0])
+	session, ok := defaultSessions.get(sessionReq)
+	if !ok {
+		t.Fatalf("env fallback cookie did not create a valid session")
+	}
+	if session.AuthSource != "env" || session.User != "admin" {
+		t.Fatalf("session = %+v, want env admin compatibility session", session)
+	}
+}
+
+func TestProfilePasswordChangeRequiresCSRF(t *testing.T) {
+	cfg, cookie, csrf, _ := loginPersistentTestUser(t, "admin-password-1")
+
+	noCSRFForm := url.Values{"current_password": {"admin-password-1"}, "new_password": {"admin-password-2"}}
+	noCSRFReq := httptest.NewRequest(http.MethodPost, "/?profile", strings.NewReader(noCSRFForm.Encode()))
+	noCSRFReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	noCSRFReq.AddCookie(cookie)
+	noCSRFRec := httptest.NewRecorder()
+	handleRequest(cfg, noCSRFRec, noCSRFReq)
+	if noCSRFRec.Result().StatusCode != http.StatusForbidden {
+		t.Fatalf("profile change without CSRF status = %d, want %d", noCSRFRec.Result().StatusCode, http.StatusForbidden)
+	}
+
+	form := url.Values{"csrf": {csrf}, "current_password": {"admin-password-1"}, "new_password": {"admin-password-2"}}
+	req := httptest.NewRequest(http.MethodPost, "/?profile", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	handleRequest(cfg, rec, req)
+	if rec.Result().StatusCode != http.StatusOK {
+		t.Fatalf("profile change status = %d, want %d", rec.Result().StatusCode, http.StatusOK)
+	}
+
+	oldLoginForm := url.Values{"email": {"admin@example.test"}, "password": {"admin-password-1"}}
+	oldLoginReq := httptest.NewRequest(http.MethodPost, "/?login", strings.NewReader(oldLoginForm.Encode()))
+	oldLoginReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	oldLoginRec := httptest.NewRecorder()
+	handleRequest(cfg, oldLoginRec, oldLoginReq)
+	if oldLoginRec.Result().StatusCode != http.StatusUnauthorized {
+		t.Fatalf("old password login status = %d, want %d", oldLoginRec.Result().StatusCode, http.StatusUnauthorized)
+	}
+
+	newLoginForm := url.Values{"email": {"admin@example.test"}, "password": {"admin-password-2"}}
+	newLoginReq := httptest.NewRequest(http.MethodPost, "/?login", strings.NewReader(newLoginForm.Encode()))
+	newLoginReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	newLoginRec := httptest.NewRecorder()
+	handleRequest(cfg, newLoginRec, newLoginReq)
+	if newLoginRec.Result().StatusCode != http.StatusSeeOther {
+		t.Fatalf("new password login status = %d, want %d", newLoginRec.Result().StatusCode, http.StatusSeeOther)
+	}
+}
+
+func TestRecoveryTokenPrimitivesStoreHashedExpiringTokens(t *testing.T) {
+	defaultSessions = newSessionStore()
+	root := t.TempDir()
+	cfg := testConfig(t, root)
+	service := siteService{config: cfg, sessions: defaultSessions}
+	user, err := service.createFirstAdmin("admin@example.test", "admin-password-1")
+	if err != nil {
+		t.Fatalf("create first admin: %v", err)
+	}
+	expiresAt := time.Now().UTC().Add(time.Hour)
+	token, err := service.createRecoveryToken(user.Id, expiresAt)
+	if err != nil {
+		t.Fatalf("create recovery token: %v", err)
+	}
+	if token == "" {
+		t.Fatalf("token is empty")
+	}
+	store, err := service.loadAuthStore()
+	if err != nil {
+		t.Fatalf("load auth store: %v", err)
+	}
+	if len(store.RecoveryTokens) != 1 {
+		t.Fatalf("recovery tokens = %+v, want one token", store.RecoveryTokens)
+	}
+	if store.RecoveryTokens[0].TokenHash == token || strings.Contains(store.RecoveryTokens[0].TokenHash, token) {
+		t.Fatalf("stored recovery token is not hashed: %+v", store.RecoveryTokens[0])
+	}
+	if !service.verifyRecoveryToken(user.Id, token, time.Now().UTC()) {
+		t.Fatalf("verifyRecoveryToken(valid) = false, want true")
+	}
+	if service.verifyRecoveryToken(user.Id, token, time.Now().UTC()) {
+		t.Fatalf("verifyRecoveryToken(reused) = true, want false")
+	}
+	if service.verifyRecoveryToken(user.Id, token, expiresAt.Add(time.Second)) {
+		t.Fatalf("verifyRecoveryToken(expired) = true, want false")
+	}
+}
+
+func TestConcurrentRecoveryTokenVerificationAllowsExactlyOneUse(t *testing.T) {
+	defaultSessions = newSessionStore()
+	root := t.TempDir()
+	cfg := testConfig(t, root)
+	service := siteService{config: cfg, sessions: defaultSessions}
+	user, err := service.createFirstAdmin("admin@example.test", "admin-password-1")
+	if err != nil {
+		t.Fatalf("create first admin: %v", err)
+	}
+	token, err := service.createRecoveryToken(user.Id, time.Now().UTC().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("create recovery token: %v", err)
+	}
+
+	const attempts = 12
+	start := make(chan struct{})
+	results := make(chan bool, attempts)
+	var wg sync.WaitGroup
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			results <- service.verifyRecoveryToken(user.Id, token, time.Now().UTC())
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	successes := 0
+	for ok := range results {
+		if ok {
+			successes++
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("successful recovery token verifications = %d, want 1", successes)
+	}
+}
+
+func TestEnvAdminFallbackStillWorksWhenNoPersistentUsersExist(t *testing.T) {
+	cfg, cookie, _ := loginTestUser(t)
+	sessionReq := httptest.NewRequest(http.MethodGet, "/?profile", nil)
+	sessionReq.AddCookie(cookie)
+	session, ok := defaultSessions.get(sessionReq)
+	if !ok {
+		t.Fatalf("env login did not create session")
+	}
+	if session.AuthSource != "env" || session.User != "admin" || session.UserID != 0 {
+		t.Fatalf("session = %+v, want env admin fallback session", session)
+	}
+
+	service := siteService{config: cfg, sessions: defaultSessions}
+	hasUsers, err := service.hasPersistentUsers()
+	if err != nil {
+		t.Fatalf("hasPersistentUsers() error = %v", err)
+	}
+	if hasUsers {
+		t.Fatalf("hasPersistentUsers() = true, want false for env-only login")
 	}
 }
 
@@ -628,4 +1066,41 @@ func loginTestUser(t *testing.T) (Config.Settings, *http.Cookie, string) {
 		t.Fatalf("login cookie did not create a valid session")
 	}
 	return cfg, cookie, session.CSRFToken
+}
+
+func loginPersistentTestUser(t *testing.T, password string) (Config.Settings, *http.Cookie, string, operatorSession) {
+	t.Helper()
+	defaultSessions = newSessionStore()
+	t.Setenv("SITEBRUSH_ADMIN_PASSWORD", "")
+	t.Setenv("SITEBRUSH_ADMIN_PASSWORD_SHA256", "")
+
+	root := t.TempDir()
+	cfg := testConfig(t, root)
+	service := siteService{config: cfg, sessions: defaultSessions}
+	if _, err := service.createFirstAdmin("admin@example.test", password); err != nil {
+		t.Fatalf("create first admin: %v", err)
+	}
+
+	form := url.Values{"email": {"admin@example.test"}, "password": {password}}
+	req := httptest.NewRequest(http.MethodPost, "/?login", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+
+	handleRequest(cfg, rec, req)
+
+	if rec.Result().StatusCode != http.StatusSeeOther {
+		t.Fatalf("persistent login status = %d, want %d", rec.Result().StatusCode, http.StatusSeeOther)
+	}
+	cookies := rec.Result().Cookies()
+	if len(cookies) == 0 {
+		t.Fatalf("persistent login did not set a session cookie")
+	}
+	cookie := cookies[0]
+	sessionReq := httptest.NewRequest(http.MethodGet, "/?profile", nil)
+	sessionReq.AddCookie(cookie)
+	session, ok := defaultSessions.get(sessionReq)
+	if !ok {
+		t.Fatalf("persistent login cookie did not create a valid session")
+	}
+	return cfg, cookie, session.CSRFToken, session
 }
