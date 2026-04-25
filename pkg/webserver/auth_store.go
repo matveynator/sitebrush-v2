@@ -307,12 +307,20 @@ func (s siteService) join(responseWriter http.ResponseWriter, request *http.Requ
 		http.Error(responseWriter, "First admin already exists", http.StatusForbidden)
 		return
 	}
+	if !bootstrapTokenConfigured() {
+		http.Error(responseWriter, "First-admin bootstrap is disabled. Set SITEBRUSH_BOOTSTRAP_TOKEN to enable one-time setup.", http.StatusServiceUnavailable)
+		return
+	}
 	switch request.Method {
 	case http.MethodGet:
 		renderHTML(responseWriter, "Create first admin", joinFormTemplate, nil)
 	case http.MethodPost:
 		if err := request.ParseForm(); err != nil {
 			http.Error(responseWriter, "Invalid join request", http.StatusBadRequest)
+			return
+		}
+		if !validateBootstrapToken(request.FormValue("bootstrap_token")) {
+			http.Error(responseWriter, "Invalid bootstrap token", http.StatusForbidden)
 			return
 		}
 		user, err := s.createFirstAdmin(request.FormValue("email"), request.FormValue("password"))

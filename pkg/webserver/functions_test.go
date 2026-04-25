@@ -775,6 +775,7 @@ func TestFirstJoinCreatesPersistentSuperuserAdmin(t *testing.T) {
 	defaultSessions = newSessionStore()
 	t.Setenv("SITEBRUSH_ADMIN_PASSWORD", "")
 	t.Setenv("SITEBRUSH_ADMIN_PASSWORD_SHA256", "")
+	t.Setenv("SITEBRUSH_BOOTSTRAP_TOKEN", "setup-token")
 	root := t.TempDir()
 	cfg := testConfig(t, root)
 
@@ -785,7 +786,7 @@ func TestFirstJoinCreatesPersistentSuperuserAdmin(t *testing.T) {
 		t.Fatalf("join GET status = %d, want %d", getRec.Result().StatusCode, http.StatusOK)
 	}
 
-	form := url.Values{"email": {"Admin@Example.test"}, "password": {"admin-password-1"}}
+	form := url.Values{"email": {"Admin@Example.test"}, "password": {"admin-password-1"}, "bootstrap_token": {"setup-token"}}
 	req := httptest.NewRequest(http.MethodPost, "/?join", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
@@ -820,6 +821,60 @@ func TestFirstJoinCreatesPersistentSuperuserAdmin(t *testing.T) {
 	}
 	if authDirInfo.Mode().Perm() != 0o700 {
 		t.Fatalf("auth store dir mode = %o, want 0700", authDirInfo.Mode().Perm())
+	}
+}
+
+func TestFirstJoinRequiresBootstrapToken(t *testing.T) {
+	defaultSessions = newSessionStore()
+	t.Setenv("SITEBRUSH_ADMIN_PASSWORD", "env-secret")
+	t.Setenv("SITEBRUSH_ADMIN_PASSWORD_SHA256", "")
+	t.Setenv("SITEBRUSH_BOOTSTRAP_TOKEN", "")
+	root := t.TempDir()
+	cfg := testConfig(t, root)
+
+	form := url.Values{"email": {"admin@example.test"}, "password": {"admin-password-1"}}
+	req := httptest.NewRequest(http.MethodPost, "/?join", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	handleRequest(cfg, rec, req)
+	if rec.Result().StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("join POST without bootstrap token status = %d, want %d", rec.Result().StatusCode, http.StatusServiceUnavailable)
+	}
+
+	service := siteService{config: cfg, sessions: defaultSessions}
+	store, err := service.loadAuthStore()
+	if err != nil {
+		t.Fatalf("load auth store: %v", err)
+	}
+	if len(store.Users) != 0 {
+		t.Fatalf("users = %+v, want no user created without bootstrap token", store.Users)
+	}
+}
+
+func TestFirstJoinRejectsWrongBootstrapToken(t *testing.T) {
+	defaultSessions = newSessionStore()
+	t.Setenv("SITEBRUSH_ADMIN_PASSWORD", "")
+	t.Setenv("SITEBRUSH_ADMIN_PASSWORD_SHA256", "")
+	t.Setenv("SITEBRUSH_BOOTSTRAP_TOKEN", "setup-token")
+	root := t.TempDir()
+	cfg := testConfig(t, root)
+
+	form := url.Values{"email": {"admin@example.test"}, "password": {"admin-password-1"}, "bootstrap_token": {"wrong"}}
+	req := httptest.NewRequest(http.MethodPost, "/?join", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	handleRequest(cfg, rec, req)
+	if rec.Result().StatusCode != http.StatusForbidden {
+		t.Fatalf("join POST wrong bootstrap token status = %d, want %d", rec.Result().StatusCode, http.StatusForbidden)
+	}
+
+	service := siteService{config: cfg, sessions: defaultSessions}
+	store, err := service.loadAuthStore()
+	if err != nil {
+		t.Fatalf("load auth store: %v", err)
+	}
+	if len(store.Users) != 0 {
+		t.Fatalf("users = %+v, want no user created with wrong bootstrap token", store.Users)
 	}
 }
 
@@ -898,6 +953,7 @@ func TestConcurrentFirstAdminJoinAllowsExactlyOneAdmin(t *testing.T) {
 	defaultSessions = newSessionStore()
 	t.Setenv("SITEBRUSH_ADMIN_PASSWORD", "")
 	t.Setenv("SITEBRUSH_ADMIN_PASSWORD_SHA256", "")
+	t.Setenv("SITEBRUSH_BOOTSTRAP_TOKEN", "setup-token")
 	root := t.TempDir()
 	cfg := testConfig(t, root)
 
@@ -910,7 +966,7 @@ func TestConcurrentFirstAdminJoinAllowsExactlyOneAdmin(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			form := url.Values{"email": {"admin@example.test"}, "password": {"admin-password-1"}}
+			form := url.Values{"email": {"admin@example.test"}, "password": {"admin-password-1"}, "bootstrap_token": {"setup-token"}}
 			req := httptest.NewRequest(http.MethodPost, "/?join", strings.NewReader(form.Encode()))
 			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 			rec := httptest.NewRecorder()

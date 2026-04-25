@@ -40,6 +40,7 @@ with `-tags gui`; the Docker image intentionally builds the non-GUI service.
 ```sh
 docker build -t sitebrush:local .
 docker run --rm -p 2444:2444 \
+  -e SITEBRUSH_BOOTSTRAP_TOKEN='<one-time-first-admin-token>' \
   -e SITEBRUSH_ADMIN_PASSWORD_SHA256='<sha256-of-admin-password>' \
   -e SITEBRUSH_ALLOWED_HOSTS='localhost,127.0.0.1' \
   -v sitebrush-data:/data \
@@ -75,12 +76,13 @@ Environment variables:
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
+| `SITEBRUSH_BOOTSTRAP_TOKEN` | First setup | One-time first-admin creation token used by `?join` while no persistent users exist. Treat it as a secret and remove it after bootstrap. |
 | `SITEBRUSH_ADMIN_PASSWORD_SHA256` | Recommended | Hex SHA-256 of the bootstrap admin password. Treat it as a secret password verifier and inject it with runtime/orchestrator secrets. |
 | `SITEBRUSH_ADMIN_PASSWORD` | Alternative | Plaintext bootstrap admin password when a hash is not provided. Use only via a runtime/orchestrator secret. |
 | `SITEBRUSH_ALLOWED_HOSTS` | Recommended | Comma-separated public host allow-list used for trusted domain-specific metadata. Local loopback hosts are allowed for local development only. |
 
-If no persistent users exist and neither admin password variable is configured,
-the login screen returns `503` with setup guidance.
+If no persistent users exist and neither env-admin password nor bootstrap token is
+configured, the login and join screens return `503` with setup guidance.
 
 Uploads are capped at 10 MiB per request body and active HTML/CSS/JS uploads are
 rejected for generic file uploads. Image uploads are decoded and validated before

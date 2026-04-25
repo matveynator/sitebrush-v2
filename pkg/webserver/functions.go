@@ -287,6 +287,20 @@ func adminPasswordConfigured() bool {
 		os.Getenv("SITEBRUSH_ADMIN_PASSWORD") != ""
 }
 
+func bootstrapTokenConfigured() bool {
+	return os.Getenv("SITEBRUSH_BOOTSTRAP_TOKEN") != ""
+}
+
+func validateBootstrapToken(token string) bool {
+	configured := os.Getenv("SITEBRUSH_BOOTSTRAP_TOKEN")
+	if configured == "" || token == "" {
+		return false
+	}
+	configuredSum := sha256.Sum256([]byte(configured))
+	tokenSum := sha256.Sum256([]byte(token))
+	return subtle.ConstantTimeCompare(configuredSum[:], tokenSum[:]) == 1
+}
+
 func validateAdminPassword(password string) bool {
 	if hash := os.Getenv("SITEBRUSH_ADMIN_PASSWORD_SHA256"); hash != "" {
 		sum := sha256.Sum256([]byte(password))
@@ -315,9 +329,9 @@ func (s siteService) login(responseWriter http.ResponseWriter, request *http.Req
 		if err != nil {
 			status = http.StatusInternalServerError
 			message = "Could not load user store."
-		} else if !hasPersistentUsers && !adminPasswordConfigured() {
+		} else if !hasPersistentUsers && !adminPasswordConfigured() && !bootstrapTokenConfigured() {
 			status = http.StatusServiceUnavailable
-			message = "Admin password is not configured. Set SITEBRUSH_ADMIN_PASSWORD_SHA256 or SITEBRUSH_ADMIN_PASSWORD."
+			message = "Admin access is not configured. Set SITEBRUSH_BOOTSTRAP_TOKEN for first-admin setup or SITEBRUSH_ADMIN_PASSWORD_SHA256/SITEBRUSH_ADMIN_PASSWORD for env-admin login."
 		}
 		responseWriter.WriteHeader(status)
 		renderHTML(responseWriter, "SiteBrush Login", loginFormTemplate, map[string]string{"Message": message})
@@ -3245,8 +3259,9 @@ const loginFormTemplate = `
 </form>`
 
 const joinFormTemplate = `
-<p>Create the first persistent SiteBrush administrator. This form is available only while no persistent users exist.</p>
+<p>Create the first persistent SiteBrush administrator. This form is available only while no persistent users exist and a bootstrap token is configured.</p>
 <form method="post" action="/?join">
+  <label>Bootstrap token <input type="password" name="bootstrap_token" autocomplete="one-time-code" required></label>
   <label>Email <input type="email" name="email" autocomplete="username" required></label>
   <label>Password <input type="password" name="password" autocomplete="new-password" minlength="8" required></label>
   <button type="submit">Create admin</button>
