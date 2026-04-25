@@ -39,6 +39,8 @@ const (
 	defaultDBDomain   = "default"
 )
 
+var errUnsafePath = errors.New("unsafe path")
+
 type siteService struct {
 	config   Config.Settings
 	sessions *sessionStore
@@ -92,8 +94,18 @@ type backupRecord struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+type pageMetadata struct {
+	Path      string    `json:"path"`
+	Title     string    `json:"title"`
+	Tags      string    `json:"tags"`
+	Status    string    `json:"status"`
+	Published bool      `json:"published"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 var defaultSessions = newSessionStore()
 var revisionWriteLocks = newKeyedMutex()
+var redirectFileLock sync.Mutex
 
 type keyedMutex struct {
 	mu    sync.Mutex
@@ -615,28 +627,53 @@ func (s siteService) revisions(responseWriter http.ResponseWriter, request *http
 // showSubpagesFunction обрабатывает запросы на отображение иерархического дерева файлов.
 func showSubpagesFunction(responseWriter http.ResponseWriter, request *http.Request, fileName string) {
 	service := newSiteService(Config.Settings{})
-	service.subpages(responseWriter, request)
+	service.subpages(responseWriter, request, fileName)
 }
 
-func (s siteService) subpages(responseWriter http.ResponseWriter, request *http.Request) {
+func (s siteService) subpages(responseWriter http.ResponseWriter, request *http.Request, fileName string) {
 	session, ok := s.requireAuth(responseWriter, request)
 	if !ok {
 		return
 	}
 	switch request.Method {
 	case http.MethodGet:
-		pages, err := listStaticPages(s.config)
+		requestURI, err := s.canonicalRequestURIForFile(fileName)
 		if err != nil {
 			http.Error(responseWriter, "Could not list subpages", http.StatusInternalServerError)
 			return
 		}
-		renderHTML(responseWriter, "Subpages", subpagesTemplate, map[string]any{"Pages": pages})
+		pages, err := s.listStaticPagesUnder(requestURI)
+		if err != nil {
+			http.Error(responseWriter, "Could not list subpages", http.StatusInternalServerError)
+			return
+		}
+		renderHTML(responseWriter, "Subpages", subpagesTemplate, map[string]any{
+			"CurrentPath": requestURI,
+			"Pages":       pages,
+			"Action":      request.URL.Path + "?subpages",
+			"CSRF":        session.CSRFToken,
+		})
 	case http.MethodPost:
 		if !s.validCSRF(request, session) {
 			http.Error(responseWriter, "Forbidden", http.StatusForbidden)
 			return
 		}
-		http.Error(responseWriter, "Subpage updates are not implemented yet", http.StatusNotImplemented)
+		if err := request.ParseForm(); err != nil {
+			http.Error(responseWriter, "Invalid subpage request", http.StatusBadRequest)
+			return
+		}
+		if err := s.createSubpage(fileName, request.FormValue("path"), request.FormValue("title")); err != nil {
+			switch {
+			case errors.Is(err, errUnsafePath):
+				http.Error(responseWriter, "Forbidden", http.StatusForbidden)
+			case errors.Is(err, os.ErrExist):
+				http.Error(responseWriter, "Subpage already exists", http.StatusConflict)
+			default:
+				http.Error(responseWriter, "Could not create subpage", http.StatusInternalServerError)
+			}
+			return
+		}
+		http.Redirect(responseWriter, request, request.URL.Path+"?subpages", http.StatusSeeOther)
 	default:
 		responseWriter.Header().Set("Allow", "GET, POST")
 		http.Error(responseWriter, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -646,23 +683,58 @@ func (s siteService) subpages(responseWriter http.ResponseWriter, request *http.
 // editPropertiesFunction обрабатывает запросы на редактирование свойств файла.
 func editPropertiesFunction(responseWriter http.ResponseWriter, request *http.Request, fileName string) {
 	service := newSiteService(Config.Settings{})
-	service.properties(responseWriter, request)
+	service.properties(responseWriter, request, fileName)
 }
 
-func (s siteService) properties(responseWriter http.ResponseWriter, request *http.Request) {
+func (s siteService) properties(responseWriter http.ResponseWriter, request *http.Request, fileName string) {
 	session, ok := s.requireAuth(responseWriter, request)
 	if !ok {
 		return
 	}
 	switch request.Method {
 	case http.MethodGet:
-		renderHTML(responseWriter, "Properties", propertiesTemplate, map[string]string{"CSRF": session.CSRFToken})
+		requestURI, err := s.canonicalRequestURIForFile(fileName)
+		if err != nil {
+			http.Error(responseWriter, "Could not load properties", http.StatusInternalServerError)
+			return
+		}
+		metadata, err := s.loadPageMetadata(request, requestURI)
+		if err != nil {
+			http.Error(responseWriter, "Could not load properties", http.StatusInternalServerError)
+			return
+		}
+		renderHTML(responseWriter, "Properties", propertiesTemplate, map[string]any{
+			"Action":    request.URL.Path + "?properties",
+			"CSRF":      session.CSRFToken,
+			"Path":      requestURI,
+			"NewPath":   requestURI,
+			"Title":     metadata.Title,
+			"Tags":      metadata.Tags,
+			"Status":    metadata.Status,
+			"Published": metadata.Published,
+		})
 	case http.MethodPost:
 		if !s.validCSRF(request, session) {
 			http.Error(responseWriter, "Forbidden", http.StatusForbidden)
 			return
 		}
-		http.Error(responseWriter, "Property updates are not implemented yet", http.StatusNotImplemented)
+		if err := request.ParseForm(); err != nil {
+			http.Error(responseWriter, "Invalid properties request", http.StatusBadRequest)
+			return
+		}
+		newURI, err := s.updateProperties(request, fileName)
+		if err != nil {
+			switch {
+			case errors.Is(err, errUnsafePath):
+				http.Error(responseWriter, "Forbidden", http.StatusForbidden)
+			case errors.Is(err, os.ErrExist):
+				http.Error(responseWriter, "Target path already exists", http.StatusConflict)
+			default:
+				http.Error(responseWriter, "Property update failed", http.StatusInternalServerError)
+			}
+			return
+		}
+		http.Redirect(responseWriter, request, newURI+"?properties", http.StatusSeeOther)
 	default:
 		responseWriter.Header().Set("Allow", "GET, POST")
 		http.Error(responseWriter, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -884,6 +956,50 @@ func safeRequestedFilePath(config Config.Settings, requestPath string) (string, 
 	return safePathUnderRoot(config.WEB_FILE_PATH, requestPath, config.WEB_INDEX_FILE, true)
 }
 
+func safeWritableStaticFilePath(config Config.Settings, requestPath string) (string, error) {
+	fileName, err := safePathUnderRoot(config.WEB_FILE_PATH, requestPath, config.WEB_INDEX_FILE, true)
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", errUnsafePath, err)
+	}
+	if err := validateExistingParentSymlinkSafe(config.WEB_FILE_PATH, fileName); err != nil {
+		return "", fmt.Errorf("%w: %v", errUnsafePath, err)
+	}
+	return fileName, nil
+}
+
+func validateExistingParentSymlinkSafe(root, targetPath string) error {
+	rootPath, err := filepath.Abs(root)
+	if err != nil {
+		return err
+	}
+	evaluatedRoot, err := filepath.EvalSymlinks(rootPath)
+	if err != nil {
+		return err
+	}
+	parent := filepath.Dir(targetPath)
+	for {
+		if _, err := os.Lstat(parent); err == nil {
+			break
+		} else if errors.Is(err, os.ErrNotExist) {
+			next := filepath.Dir(parent)
+			if next == parent {
+				return err
+			}
+			parent = next
+		} else {
+			return err
+		}
+	}
+	evaluatedParent, err := filepath.EvalSymlinks(parent)
+	if err != nil {
+		return err
+	}
+	if !pathIsInsideRoot(evaluatedRoot, evaluatedParent) {
+		return errUnsafePath
+	}
+	return nil
+}
+
 func (s siteService) canonicalRequestURIForFile(fileName string) (string, error) {
 	rootPath, err := filepath.Abs(s.config.WEB_FILE_PATH)
 	if err != nil {
@@ -894,7 +1010,7 @@ func (s siteService) canonicalRequestURIForFile(fileName string) (string, error)
 		return "", err
 	}
 	if !pathIsInsideRoot(rootPath, targetPath) {
-		return "", errors.New("unsafe path")
+		return "", errUnsafePath
 	}
 	relativePath, err := filepath.Rel(rootPath, targetPath)
 	if err != nil {
@@ -928,16 +1044,16 @@ func safePathUnderRoot(root, requestPath, indexFile string, appendIndex bool) (s
 		return "", err
 	}
 	if strings.Contains(unescapedPath, `\`) {
-		return "", errors.New("unsafe path")
+		return "", errUnsafePath
 	}
 	if strings.HasPrefix(unescapedPath, "//") {
-		return "", errors.New("unsafe path")
+		return "", errUnsafePath
 	}
 
 	segments := strings.Split(unescapedPath, "/")
 	for _, segment := range segments {
 		if segment == ".." || strings.Contains(segment, ":") {
-			return "", errors.New("unsafe path")
+			return "", errUnsafePath
 		}
 	}
 
@@ -960,13 +1076,13 @@ func safePathUnderRoot(root, requestPath, indexFile string, appendIndex bool) (s
 		return "", err
 	}
 	if !pathIsInsideRoot(rootPath, targetPath) {
-		return "", errors.New("unsafe path")
+		return "", errUnsafePath
 	}
 
 	evaluatedRoot, err := filepath.EvalSymlinks(rootPath)
 	if err == nil {
 		if evaluatedTarget, err := filepath.EvalSymlinks(targetPath); err == nil && !pathIsInsideRoot(evaluatedRoot, evaluatedTarget) {
-			return "", errors.New("unsafe path")
+			return "", errUnsafePath
 		}
 	}
 
@@ -1184,6 +1300,369 @@ func safeJoinUnderRoot(root string, elems ...string) (string, error) {
 	return targetPath, nil
 }
 
+func (s siteService) metadataPath(requestURI string) string {
+	return filepath.Join(s.archiveRoot(), "metadata", safeArchiveName(requestURI)+".json")
+}
+
+func (s siteService) redirectsPath() string {
+	return filepath.Join(s.archiveRoot(), "redirects.json")
+}
+
+func safeArchiveName(requestURI string) string {
+	safeName := strings.Trim(strings.ReplaceAll(pathpkg.Clean("/"+strings.TrimPrefix(requestURI, "/")), "/", "_"), "_")
+	if safeName == "" {
+		safeName = "index"
+	}
+	sum := sha256.Sum256([]byte(pathpkg.Clean("/" + strings.TrimPrefix(requestURI, "/"))))
+	return fmt.Sprintf("%s-%s", safeName, hex.EncodeToString(sum[:])[:12])
+}
+
+func (s siteService) loadSidecarMetadata(requestURI string) (pageMetadata, error) {
+	metadata := pageMetadata{
+		Path:      requestURI,
+		Title:     titleFromRequestURI(requestURI),
+		Status:    "active",
+		Published: true,
+	}
+	data, err := os.ReadFile(s.metadataPath(requestURI))
+	if errors.Is(err, os.ErrNotExist) {
+		return metadata, nil
+	}
+	if err != nil {
+		return pageMetadata{}, err
+	}
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return pageMetadata{}, err
+	}
+	if metadata.Path == "" {
+		metadata.Path = requestURI
+	}
+	if metadata.Title == "" {
+		metadata.Title = titleFromRequestURI(requestURI)
+	}
+	if metadata.Status == "" {
+		metadata.Status = "active"
+	}
+	return metadata, nil
+}
+
+func (s siteService) loadPageMetadata(request *http.Request, requestURI string) (pageMetadata, error) {
+	metadata, err := s.loadSidecarMetadata(requestURI)
+	if err != nil {
+		return pageMetadata{}, err
+	}
+	if !s.dbPostRevisionConfigured() {
+		return metadata, nil
+	}
+	domain, trusted := trustedDBRevisionDomain(request)
+	if !trusted {
+		log.Printf("SiteBrush properties metadata using default domain for untrusted host %q", request.Host)
+	}
+	posts, err := Database.LoadPostRevisionsFromConfig(s.config, requestURI, domain)
+	if err != nil {
+		return pageMetadata{}, err
+	}
+	if len(posts) == 0 {
+		return metadata, nil
+	}
+	latest := posts[len(posts)-1]
+	if latest.Title != "" {
+		metadata.Title = latest.Title
+	}
+	metadata.Tags = latest.Tags
+	if latest.Status != "" {
+		metadata.Status = latest.Status
+	}
+	metadata.Published = latest.Published
+	return metadata, nil
+}
+
+func (s siteService) writePageMetadata(metadata pageMetadata) error {
+	if metadata.Status == "" {
+		metadata.Status = "active"
+	}
+	metadata.UpdatedAt = time.Now().UTC()
+	data, err := json.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicWriteFile(s.metadataPath(metadata.Path), data, 0o600)
+}
+
+func (s siteService) removePageMetadata(requestURI string) error {
+	metadataPath := s.metadataPath(requestURI)
+	if err := os.Remove(metadataPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return syncDir(filepath.Dir(metadataPath))
+}
+
+func (s siteService) updateProperties(request *http.Request, currentFileName string) (string, error) {
+	currentURI, err := s.canonicalRequestURIForFile(currentFileName)
+	if err != nil {
+		return "", err
+	}
+	newPath := strings.TrimSpace(request.FormValue("new_path"))
+	if newPath == "" {
+		newPath = currentURI
+	}
+	if !strings.HasPrefix(newPath, "/") {
+		newPath = "/" + newPath
+	}
+	newFileName, err := safeWritableStaticFilePath(s.config, newPath)
+	if err != nil {
+		return "", err
+	}
+	newURI, err := s.canonicalRequestURIForFile(newFileName)
+	if err != nil {
+		return "", err
+	}
+	metadata := pageMetadata{
+		Path:      newURI,
+		Title:     strings.TrimSpace(request.FormValue("title")),
+		Tags:      strings.TrimSpace(request.FormValue("tags")),
+		Status:    strings.TrimSpace(request.FormValue("status")),
+		Published: request.FormValue("published") != "",
+	}
+	if metadata.Title == "" {
+		metadata.Title = titleFromRequestURI(newURI)
+	}
+	if metadata.Status == "" {
+		metadata.Status = "active"
+	}
+	if err := s.writePageMetadata(metadata); err != nil {
+		return "", err
+	}
+	if newURI != currentURI {
+		renamed := false
+		if err := s.renameStaticFile(currentFileName, newFileName); err != nil {
+			if cleanupErr := s.removePageMetadata(newURI); cleanupErr != nil {
+				return "", fmt.Errorf("rename failed after metadata write: %w; metadata cleanup failed: %v", err, cleanupErr)
+			}
+			return "", err
+		}
+		renamed = true
+		domain, trusted := trustedDBRevisionDomain(request)
+		if !trusted {
+			log.Printf("SiteBrush redirect using default domain for untrusted host %q", request.Host)
+		}
+		redirect := Data.Redirect{
+			OldUri: currentURI,
+			NewUri: newURI,
+			Date:   time.Now().UTC().UnixMilli(),
+			Status: "active",
+			Domain: domain,
+		}
+		if err := s.saveRedirect(redirect); err != nil {
+			if renamed {
+				if rollbackErr := s.renameStaticFile(newFileName, currentFileName); rollbackErr != nil {
+					return "", fmt.Errorf("save redirect failed after rename: %w; rollback failed: %v", err, rollbackErr)
+				}
+			}
+			if cleanupErr := s.removePageMetadata(newURI); cleanupErr != nil {
+				return "", fmt.Errorf("save redirect failed after metadata write: %w; metadata cleanup failed: %v", err, cleanupErr)
+			}
+			return "", err
+		}
+	}
+	return newURI, nil
+}
+
+func (s siteService) renameStaticFile(currentFileName, newFileName string) error {
+	currentAbs, err := filepath.Abs(currentFileName)
+	if err != nil {
+		return err
+	}
+	newAbs, err := filepath.Abs(newFileName)
+	if err != nil {
+		return err
+	}
+	if currentAbs == newAbs {
+		return nil
+	}
+	if err := validateExistingParentSymlinkSafe(s.config.WEB_FILE_PATH, newAbs); err != nil {
+		return fmt.Errorf("%w: %v", errUnsafePath, err)
+	}
+	if _, err := os.Stat(newAbs); err == nil {
+		return os.ErrExist
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if _, err := os.Stat(currentAbs); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(newAbs), 0o755); err != nil {
+		return err
+	}
+	if err := os.Rename(currentAbs, newAbs); err != nil {
+		return err
+	}
+	if err := syncDir(filepath.Dir(newAbs)); err != nil {
+		return rollbackRenameAfterSyncFailure(currentAbs, newAbs, err)
+	}
+	if filepath.Dir(currentAbs) != filepath.Dir(newAbs) {
+		if err := syncDir(filepath.Dir(currentAbs)); err != nil {
+			return rollbackRenameAfterSyncFailure(currentAbs, newAbs, err)
+		}
+	}
+	return nil
+}
+
+func rollbackRenameAfterSyncFailure(currentAbs, newAbs string, syncErr error) error {
+	if rollbackErr := os.Rename(newAbs, currentAbs); rollbackErr != nil {
+		return fmt.Errorf("rename sync failed: %w; rollback failed: %v", syncErr, rollbackErr)
+	}
+	if err := syncDir(filepath.Dir(currentAbs)); err != nil {
+		return fmt.Errorf("rename sync failed: %w; rollback sync failed: %v", syncErr, err)
+	}
+	if filepath.Dir(currentAbs) != filepath.Dir(newAbs) {
+		if err := syncDir(filepath.Dir(newAbs)); err != nil {
+			return fmt.Errorf("rename sync failed: %w; rollback cleanup sync failed: %v", syncErr, err)
+		}
+	}
+	return syncErr
+}
+
+func (s siteService) loadRedirects() ([]Data.Redirect, error) {
+	data, err := os.ReadFile(s.redirectsPath())
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var redirects []Data.Redirect
+	if err := json.Unmarshal(data, &redirects); err != nil {
+		return nil, err
+	}
+	return redirects, nil
+}
+
+func restoreRedirectsFile(redirectsPath string, previousContent []byte, existed bool) error {
+	if existed {
+		return atomicWriteFile(redirectsPath, previousContent, 0o600)
+	}
+	if err := os.Remove(redirectsPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return syncDir(filepath.Dir(redirectsPath))
+}
+
+func (s siteService) saveRedirect(redirect Data.Redirect) error {
+	redirectFileLock.Lock()
+	defer redirectFileLock.Unlock()
+
+	redirectsPath := s.redirectsPath()
+	previousContent, readErr := os.ReadFile(redirectsPath)
+	previousExisted := true
+	if errors.Is(readErr, os.ErrNotExist) {
+		previousExisted = false
+	} else if readErr != nil {
+		return readErr
+	}
+	redirects, err := s.loadRedirects()
+	if err != nil {
+		return err
+	}
+	replaced := false
+	for i := range redirects {
+		if redirects[i].OldUri == redirect.OldUri && redirects[i].Domain == redirect.Domain {
+			redirects[i] = redirect
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		redirects = append(redirects, redirect)
+	}
+	data, err := json.MarshalIndent(redirects, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := atomicWriteFile(s.redirectsPath(), data, 0o600); err != nil {
+		return err
+	}
+	if s.dbPostRevisionConfigured() {
+		if _, err := Database.SaveRedirectFromConfig(s.config, redirect); err != nil {
+			if rollbackErr := restoreRedirectsFile(redirectsPath, previousContent, previousExisted); rollbackErr != nil {
+				return fmt.Errorf("database redirect save failed: %w; redirects rollback failed: %v", err, rollbackErr)
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+func (s siteService) findRedirect(request *http.Request, oldURI string) (Data.Redirect, bool, error) {
+	domain, trusted := trustedDBRevisionDomain(request)
+	if !trusted {
+		log.Printf("SiteBrush redirect lookup using default domain for untrusted host %q", request.Host)
+	}
+	if s.dbPostRevisionConfigured() {
+		redirect, ok, err := Database.LoadRedirectFromConfig(s.config, oldURI, domain)
+		if err != nil {
+			return Data.Redirect{}, false, err
+		}
+		if ok {
+			return redirect, true, nil
+		}
+	}
+	redirects, err := s.loadRedirects()
+	if err != nil {
+		return Data.Redirect{}, false, err
+	}
+	for _, redirect := range redirects {
+		if redirect.OldUri == oldURI && redirect.Domain == domain && redirect.Status == "active" {
+			return redirect, true, nil
+		}
+	}
+	return Data.Redirect{}, false, nil
+}
+
+func validInternalRedirectTarget(target string) bool {
+	if target == "" || !strings.HasPrefix(target, "/") || strings.HasPrefix(target, "//") {
+		return false
+	}
+	if strings.Contains(target, `\`) {
+		return false
+	}
+	if strings.IndexFunc(target, func(r rune) bool {
+		return unicode.IsControl(r) || unicode.IsSpace(r)
+	}) >= 0 {
+		return false
+	}
+	parsed, err := url.Parse(target)
+	if err != nil {
+		return false
+	}
+	if parsed.IsAbs() || parsed.Host != "" || !strings.HasPrefix(parsed.Path, "/") {
+		return false
+	}
+	unescapedPath, err := url.PathUnescape(parsed.Path)
+	if err != nil {
+		return false
+	}
+	if strings.Contains(unescapedPath, `\`) {
+		return false
+	}
+	if strings.HasPrefix(unescapedPath, "//") {
+		return false
+	}
+	if strings.IndexFunc(unescapedPath, func(r rune) bool {
+		return unicode.IsControl(r) || unicode.IsSpace(r)
+	}) >= 0 {
+		return false
+	}
+	for _, segment := range strings.Split(unescapedPath, "/") {
+		if segment == ".." {
+			return false
+		}
+	}
+	return true
+}
+
 func handleRequest(config Config.Settings, responseWriter http.ResponseWriter, request *http.Request) {
 	service := siteService{config: config, sessions: defaultSessions}
 	service.handle(responseWriter, request)
@@ -1209,11 +1688,30 @@ func (s siteService) handle(responseWriter http.ResponseWriter, request *http.Re
 
 	switch action {
 	case "":
-		if !checkFileExist(fileName) {
+		if checkFileExist(fileName) {
+			http.ServeFile(responseWriter, request, fileName)
+			return
+		}
+		requestURI, err := s.canonicalRequestURIForFile(fileName)
+		if err != nil {
+			http.Error(responseWriter, "Forbidden", http.StatusForbidden)
+			return
+		}
+		redirect, ok, err := s.findRedirect(request, requestURI)
+		if err != nil {
+			http.Error(responseWriter, "Redirect lookup failed", http.StatusInternalServerError)
+			return
+		}
+		if !ok {
 			http.Error(responseWriter, "Not Found", http.StatusNotFound)
 			return
 		}
-		http.ServeFile(responseWriter, request, fileName)
+		if !validInternalRedirectTarget(redirect.NewUri) {
+			log.Printf("SiteBrush rejected unsafe redirect target for %q: %q", requestURI, redirect.NewUri)
+			http.Error(responseWriter, "Not Found", http.StatusNotFound)
+			return
+		}
+		http.Redirect(responseWriter, request, redirect.NewUri, http.StatusMovedPermanently)
 	case "login":
 		s.login(responseWriter, request)
 	case "edit":
@@ -1223,9 +1721,9 @@ func (s siteService) handle(responseWriter http.ResponseWriter, request *http.Re
 	case "revisions":
 		s.revisions(responseWriter, request, fileName)
 	case "subpages":
-		s.subpages(responseWriter, request)
+		s.subpages(responseWriter, request, fileName)
 	case "properties":
-		s.properties(responseWriter, request)
+		s.properties(responseWriter, request, fileName)
 	case "freeze":
 		s.setFreeze(responseWriter, request, true)
 	case "unfreeze":
@@ -1658,6 +2156,115 @@ func fileChecksum(path string) (string, int64, error) {
 	return hex.EncodeToString(hash.Sum(nil)), size, nil
 }
 
+func (s siteService) listStaticPagesUnder(currentURI string) ([]string, error) {
+	rootPath, err := filepath.Abs(s.config.WEB_FILE_PATH)
+	if err != nil {
+		return nil, err
+	}
+	prefix := subpagePrefix(currentURI)
+	pages := []string{}
+	err = filepath.WalkDir(rootPath, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
+		if filepath.Ext(entry.Name()) != ".html" {
+			return nil
+		}
+		absolutePath, err := filepath.Abs(path)
+		if err != nil {
+			return err
+		}
+		if !pathIsInsideRoot(rootPath, absolutePath) {
+			return errUnsafePath
+		}
+		uri, err := s.canonicalRequestURIForFile(absolutePath)
+		if err != nil {
+			return err
+		}
+		if uri == currentURI {
+			return nil
+		}
+		if strings.HasPrefix(uri, prefix) {
+			pages = append(pages, uri)
+		}
+		return nil
+	})
+	sort.Strings(pages)
+	return pages, err
+}
+
+func subpagePrefix(currentURI string) string {
+	if currentURI == "" || currentURI == "/" {
+		return "/"
+	}
+	if strings.HasSuffix(currentURI, "/") {
+		return currentURI
+	}
+	ext := pathpkg.Ext(currentURI)
+	if ext != "" {
+		return strings.TrimSuffix(currentURI, ext) + "/"
+	}
+	return strings.TrimRight(currentURI, "/") + "/"
+}
+
+func (s siteService) createSubpage(currentFileName, requestedPath, title string) error {
+	requestedPath = strings.TrimSpace(requestedPath)
+	if requestedPath == "" {
+		return errUnsafePath
+	}
+	if containsPathTraversalSegment(requestedPath) {
+		return errUnsafePath
+	}
+	if !strings.HasSuffix(requestedPath, ".html") && !strings.HasSuffix(requestedPath, "/") {
+		requestedPath += ".html"
+	}
+	if !strings.HasPrefix(requestedPath, "/") {
+		currentURI, err := s.canonicalRequestURIForFile(currentFileName)
+		if err != nil {
+			return err
+		}
+		requestedPath = pathpkg.Join(subpagePrefix(currentURI), requestedPath)
+		if !strings.HasPrefix(requestedPath, "/") {
+			requestedPath = "/" + requestedPath
+		}
+	}
+	fileName, err := safeWritableStaticFilePath(s.config, requestedPath)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(fileName); err == nil {
+		return os.ErrExist
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	title = strings.TrimSpace(title)
+	if title == "" {
+		uri, err := s.canonicalRequestURIForFile(fileName)
+		if err != nil {
+			return err
+		}
+		title = titleFromRequestURI(uri)
+	}
+	body := "<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>" + template.HTMLEscapeString(title) + "</title></head><body><h1>" + template.HTMLEscapeString(title) + "</h1></body></html>\n"
+	return atomicWriteFile(fileName, []byte(body), 0o644)
+}
+
+func containsPathTraversalSegment(path string) bool {
+	unescapedPath, err := url.PathUnescape(path)
+	if err != nil {
+		return true
+	}
+	for _, segment := range strings.Split(unescapedPath, "/") {
+		if segment == ".." {
+			return true
+		}
+	}
+	return false
+}
+
 func listStaticPages(config Config.Settings) ([]string, error) {
 	rootPath, err := filepath.Abs(config.WEB_FILE_PATH)
 	if err != nil {
@@ -1737,12 +2344,27 @@ const revisionsTemplate = `
 {{end}}`
 
 const subpagesTemplate = `
+<p>Current path: {{.Data.CurrentPath}}</p>
 {{if .Data.Pages}}<ul>{{range .Data.Pages}}<li>{{.}}</li>{{end}}</ul>{{else}}<p>No pages found.</p>{{end}}
-<p>Navigation metadata updates are deferred for the MVP.</p>`
+<form method="post" action="{{.Data.Action}}">
+  <input type="hidden" name="csrf" value="{{.Data.CSRF}}">
+  <label>New subpage path <input name="path" placeholder="child.html"></label>
+  <label>Title <input name="title"></label>
+  <button type="submit">Create subpage</button>
+</form>
+<p>Recursive subpage move/navigation metadata updates are deferred.</p>`
 
 const propertiesTemplate = `
-<p>Property editing is deferred for the MVP text/code editing slice.</p>
-<form method="post"><input type="hidden" name="csrf" value="{{.Data.CSRF}}"><button type="submit">Save properties</button></form>`
+<p>Current path: {{.Data.Path}}</p>
+<form method="post" action="{{.Data.Action}}">
+  <input type="hidden" name="csrf" value="{{.Data.CSRF}}">
+  <label>Title <input name="title" value="{{.Data.Title}}"></label>
+  <label>Tags <input name="tags" value="{{.Data.Tags}}"></label>
+  <label>Status <input name="status" value="{{.Data.Status}}"></label>
+  <label>Published <input type="checkbox" name="published" value="1" {{if .Data.Published}}checked{{end}}></label>
+  <label>New path <input name="new_path" value="{{.Data.NewPath}}"></label>
+  <button type="submit">Save properties</button>
+</form>`
 
 const profileTemplate = `
 <p>User: {{.Data.User}}</p>

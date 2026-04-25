@@ -19,6 +19,7 @@ import (
 	"time"
 
 	Config "sitebrush/pkg/config"
+	Data "sitebrush/pkg/data"
 )
 
 func testConfig(t *testing.T, webRoot string) Config.Settings {
@@ -1207,6 +1208,340 @@ func TestEditPostNormalizesEncodedPathForDBAndJSONRevisions(t *testing.T) {
 	}
 	if len(aliasRecords) != 0 {
 		t.Fatalf("alias revision records = %+v, want none", aliasRecords)
+	}
+}
+
+func TestPropertiesPostRequiresCSRFAndDoesNotRenameFile(t *testing.T) {
+	cfg, cookie, _ := loginTestUser(t)
+	writeFixtureFile(t, cfg.WEB_FILE_PATH, "docs/page.html", "original")
+
+	form := url.Values{"new_path": {"/docs/renamed.html"}, "title": {"Renamed"}}
+	req := httptest.NewRequest(http.MethodPost, "/docs/page.html?properties", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+
+	handleRequest(cfg, rec, req)
+
+	if rec.Result().StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", rec.Result().StatusCode, http.StatusForbidden)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.WEB_FILE_PATH, "docs/page.html")); err != nil {
+		t.Fatalf("original file stat: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.WEB_FILE_PATH, "docs/renamed.html")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("renamed file stat error = %v, want not exist", err)
+	}
+}
+
+func TestPropertiesSafeRenamePersistsMetadataAndRedirects(t *testing.T) {
+	cfg, cookie, csrf := loginTestUser(t)
+	t.Setenv("SITEBRUSH_ALLOWED_HOSTS", "example.com")
+	cfg.DB_TYPE = "sqlite"
+	cfg.DB_FULL_FILE_PATH = filepath.Join(t.TempDir(), "sitebrush.db")
+	writeFixtureFile(t, cfg.WEB_FILE_PATH, "docs/page.html", "original")
+
+	form := url.Values{
+		"csrf":      {csrf},
+		"new_path":  {"/docs/renamed.html"},
+		"title":     {"Renamed Title"},
+		"tags":      {"alpha, beta"},
+		"status":    {"active"},
+		"published": {"1"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/docs/page.html?properties", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+
+	handleRequest(cfg, rec, req)
+
+	if rec.Result().StatusCode != http.StatusSeeOther {
+		t.Fatalf("status = %d, want %d", rec.Result().StatusCode, http.StatusSeeOther)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.WEB_FILE_PATH, "docs/page.html")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old file stat error = %v, want not exist", err)
+	}
+	data, err := os.ReadFile(filepath.Join(cfg.WEB_FILE_PATH, "docs/renamed.html"))
+	if err != nil {
+		t.Fatalf("read renamed file: %v", err)
+	}
+	if string(data) != "original" {
+		t.Fatalf("renamed file content = %q, want original", string(data))
+	}
+
+	service := siteService{config: cfg, sessions: defaultSessions}
+	metadata, err := service.loadSidecarMetadata("/docs/renamed.html")
+	if err != nil {
+		t.Fatalf("load metadata: %v", err)
+	}
+	if metadata.Title != "Renamed Title" || metadata.Tags != "alpha, beta" || metadata.Status != "active" || !metadata.Published {
+		t.Fatalf("metadata = %+v, want title/tags/status/published persisted", metadata)
+	}
+
+	db, err := sql.Open("sqlite", cfg.DB_FULL_FILE_PATH)
+	if err != nil {
+		t.Fatalf("open redirect db: %v", err)
+	}
+	defer db.Close()
+	var newURI, domain string
+	if err := db.QueryRow("SELECT NewUri, Domain FROM Redirect WHERE OldUri = ?", "/docs/page.html").Scan(&newURI, &domain); err != nil {
+		t.Fatalf("query redirect: %v", err)
+	}
+	if newURI != "/docs/renamed.html" || domain != "example.com" {
+		t.Fatalf("db redirect newURI/domain = %q/%q, want /docs/renamed.html/example.com", newURI, domain)
+	}
+
+	oldReq := httptest.NewRequest(http.MethodGet, "/docs/page.html", nil)
+	oldRec := httptest.NewRecorder()
+	handleRequest(cfg, oldRec, oldReq)
+	if oldRec.Result().StatusCode != http.StatusMovedPermanently {
+		t.Fatalf("old path status = %d, want %d", oldRec.Result().StatusCode, http.StatusMovedPermanently)
+	}
+	if location := oldRec.Result().Header.Get("Location"); location != "/docs/renamed.html" {
+		t.Fatalf("redirect Location = %q, want /docs/renamed.html", location)
+	}
+
+	writeFixtureFile(t, cfg.WEB_FILE_PATH, "docs/page.html", "new old-path content")
+	reusedReq := httptest.NewRequest(http.MethodGet, "/docs/page.html", nil)
+	reusedRec := httptest.NewRecorder()
+	handleRequest(cfg, reusedRec, reusedReq)
+	reusedBody, err := io.ReadAll(reusedRec.Result().Body)
+	if err != nil {
+		t.Fatalf("read reused path body: %v", err)
+	}
+	if reusedRec.Result().StatusCode != http.StatusOK || !strings.Contains(string(reusedBody), "new old-path content") {
+		t.Fatalf("reused path status/body = %d/%q, want static file to shadow old redirect", reusedRec.Result().StatusCode, string(reusedBody))
+	}
+}
+
+func TestPropertiesRollbackRestoresRedirectsAfterDBRedirectFailure(t *testing.T) {
+	cfg, cookie, csrf := loginTestUser(t)
+	writeFixtureFile(t, cfg.WEB_FILE_PATH, "docs/page.html", "original")
+
+	service := siteService{config: cfg, sessions: defaultSessions}
+	oldRedirect := Data.Redirect{
+		OldUri: "/older.html",
+		NewUri: "/still-current.html",
+		Date:   123,
+		Status: "active",
+		Domain: defaultDBDomain,
+	}
+	if err := service.saveRedirect(oldRedirect); err != nil {
+		t.Fatalf("seed old redirect: %v", err)
+	}
+	originalRedirects, err := os.ReadFile(service.redirectsPath())
+	if err != nil {
+		t.Fatalf("read seeded redirects: %v", err)
+	}
+	cfg.DB_TYPE = "sqlite"
+	cfg.DB_FULL_FILE_PATH = filepath.Join(t.TempDir(), "missing-parent", "sitebrush.db")
+	service = siteService{config: cfg, sessions: defaultSessions}
+
+	form := url.Values{
+		"csrf":      {csrf},
+		"new_path":  {"/docs/renamed.html"},
+		"title":     {"Renamed Title"},
+		"status":    {"active"},
+		"published": {"1"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/docs/page.html?properties", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+
+	handleRequest(cfg, rec, req)
+
+	if rec.Result().StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", rec.Result().StatusCode, http.StatusInternalServerError)
+	}
+	oldFileData, err := os.ReadFile(filepath.Join(cfg.WEB_FILE_PATH, "docs/page.html"))
+	if err != nil {
+		t.Fatalf("old file after rollback: %v", err)
+	}
+	if string(oldFileData) != "original" {
+		t.Fatalf("old file content = %q, want original", string(oldFileData))
+	}
+	if _, err := os.Stat(filepath.Join(cfg.WEB_FILE_PATH, "docs/renamed.html")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("new file stat error = %v, want not exist", err)
+	}
+	if _, err := os.Stat(service.metadataPath("/docs/renamed.html")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("new metadata stat error = %v, want not exist", err)
+	}
+	currentRedirects, err := os.ReadFile(service.redirectsPath())
+	if err != nil {
+		t.Fatalf("read redirects after rollback: %v", err)
+	}
+	if string(currentRedirects) != string(originalRedirects) {
+		t.Fatalf("redirects file changed after rollback:\n got %s\nwant %s", currentRedirects, originalRedirects)
+	}
+	redirects, err := service.loadRedirects()
+	if err != nil {
+		t.Fatalf("load redirects after rollback: %v", err)
+	}
+	if len(redirects) != 1 || redirects[0].OldUri != oldRedirect.OldUri || redirects[0].NewUri != oldRedirect.NewUri {
+		t.Fatalf("redirects after rollback = %+v, want only old redirect", redirects)
+	}
+	if _, err := os.Stat(cfg.DB_FULL_FILE_PATH); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("db file stat error = %v, want not exist", err)
+	}
+}
+
+func TestSafeArchiveNameAvoidsSlashUnderscoreCollisions(t *testing.T) {
+	slashed := safeArchiveName("/docs/a_b.html")
+	underscored := safeArchiveName("/docs/a/b.html")
+	if slashed == underscored {
+		t.Fatalf("safeArchiveName collision: both paths produced %q", slashed)
+	}
+	if !strings.HasPrefix(slashed, "docs_a_b.html-") || !strings.HasPrefix(underscored, "docs_a_b.html-") {
+		t.Fatalf("safeArchiveName = %q/%q, want readable prefix plus hash", slashed, underscored)
+	}
+}
+
+func TestStoredRedirectTargetsMustBeInternalPaths(t *testing.T) {
+	tests := []struct {
+		name         string
+		target       string
+		wantStatus   int
+		wantLocation string
+	}{
+		{name: "absolute external URL", target: "https://evil.example", wantStatus: http.StatusNotFound},
+		{name: "scheme-relative external URL", target: "//evil.example", wantStatus: http.StatusNotFound},
+		{name: "valid internal path", target: "/docs/renamed.html", wantStatus: http.StatusMovedPermanently, wantLocation: "/docs/renamed.html"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			cfg := testConfig(t, root)
+			service := siteService{config: cfg, sessions: defaultSessions}
+			if err := service.saveRedirect(Data.Redirect{
+				OldUri: "/docs/page.html",
+				NewUri: tt.target,
+				Date:   time.Now().UTC().UnixMilli(),
+				Status: "active",
+				Domain: defaultDBDomain,
+			}); err != nil {
+				t.Fatalf("save redirect: %v", err)
+			}
+
+			req := httptest.NewRequest(http.MethodGet, "/docs/page.html", nil)
+			rec := httptest.NewRecorder()
+			handleRequest(cfg, rec, req)
+
+			if rec.Result().StatusCode != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", rec.Result().StatusCode, tt.wantStatus)
+			}
+			if location := rec.Result().Header.Get("Location"); location != tt.wantLocation {
+				t.Fatalf("Location = %q, want %q", location, tt.wantLocation)
+			}
+		})
+	}
+}
+
+func TestPropertiesRejectsTraversalRename(t *testing.T) {
+	cfg, cookie, csrf := loginTestUser(t)
+	writeFixtureFile(t, cfg.WEB_FILE_PATH, "docs/page.html", "original")
+
+	form := url.Values{"csrf": {csrf}, "new_path": {"/docs/%2e%2e/escape.html"}}
+	req := httptest.NewRequest(http.MethodPost, "/docs/page.html?properties", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+
+	handleRequest(cfg, rec, req)
+
+	if rec.Result().StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", rec.Result().StatusCode, http.StatusForbidden)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.WEB_FILE_PATH, "docs/page.html")); err != nil {
+		t.Fatalf("original file stat: %v", err)
+	}
+}
+
+func TestSubpagesRejectsRelativeTraversalCreation(t *testing.T) {
+	cfg, cookie, csrf := loginTestUser(t)
+	writeFixtureFile(t, cfg.WEB_FILE_PATH, "docs/page.html", "original")
+
+	form := url.Values{"csrf": {csrf}, "path": {"../escape"}, "title": {"Escape"}}
+	req := httptest.NewRequest(http.MethodPost, "/docs/page.html?subpages", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+
+	handleRequest(cfg, rec, req)
+
+	if rec.Result().StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", rec.Result().StatusCode, http.StatusForbidden)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.WEB_FILE_PATH, "escape.html")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("escaped subpage stat error = %v, want not exist", err)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.WEB_FILE_PATH, "docs/escape.html")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("docs subpage stat error = %v, want not exist", err)
+	}
+}
+
+func TestPropertiesGetShowsCurrentMetadataFields(t *testing.T) {
+	cfg, cookie, csrf := loginTestUser(t)
+	writeFixtureFile(t, cfg.WEB_FILE_PATH, "docs/page.html", "original")
+
+	form := url.Values{
+		"csrf":      {csrf},
+		"new_path":  {"/docs/page.html"},
+		"title":     {"Stored Title"},
+		"tags":      {"one two"},
+		"status":    {"draft"},
+		"published": {"1"},
+	}
+	postReq := httptest.NewRequest(http.MethodPost, "/docs/page.html?properties", strings.NewReader(form.Encode()))
+	postReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	postReq.AddCookie(cookie)
+	postRec := httptest.NewRecorder()
+	handleRequest(cfg, postRec, postReq)
+	if postRec.Result().StatusCode != http.StatusSeeOther {
+		t.Fatalf("properties post status = %d, want %d", postRec.Result().StatusCode, http.StatusSeeOther)
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, "/docs/page.html?properties", nil)
+	getReq.AddCookie(cookie)
+	getRec := httptest.NewRecorder()
+	handleRequest(cfg, getRec, getReq)
+	body, err := io.ReadAll(getRec.Result().Body)
+	if err != nil {
+		t.Fatalf("read properties body: %v", err)
+	}
+	if getRec.Result().StatusCode != http.StatusOK ||
+		!strings.Contains(string(body), "Current path: /docs/page.html") ||
+		!strings.Contains(string(body), `value="Stored Title"`) ||
+		!strings.Contains(string(body), `value="one two"`) ||
+		!strings.Contains(string(body), `value="draft"`) {
+		t.Fatalf("properties status/body = %d/%q, want persisted fields", getRec.Result().StatusCode, string(body))
+	}
+}
+
+func TestSubpagesListsCanonicalPagesUnderCurrentPath(t *testing.T) {
+	cfg, cookie, _ := loginTestUser(t)
+	writeFixtureFile(t, cfg.WEB_FILE_PATH, "docs/index.html", "docs")
+	writeFixtureFile(t, cfg.WEB_FILE_PATH, "docs/a.html", "a")
+	writeFixtureFile(t, cfg.WEB_FILE_PATH, "docs/nested/index.html", "nested")
+	writeFixtureFile(t, cfg.WEB_FILE_PATH, "other.html", "other")
+
+	req := httptest.NewRequest(http.MethodGet, "/docs/?subpages", nil)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	handleRequest(cfg, rec, req)
+	body, err := io.ReadAll(rec.Result().Body)
+	if err != nil {
+		t.Fatalf("read subpages body: %v", err)
+	}
+	bodyText := string(body)
+	if rec.Result().StatusCode != http.StatusOK ||
+		!strings.Contains(bodyText, "/docs/a.html") ||
+		!strings.Contains(bodyText, "/docs/nested/") ||
+		strings.Contains(bodyText, "/other.html") ||
+		strings.Contains(bodyText, "/docs/index.html") {
+		t.Fatalf("subpages status/body = %d/%q, want canonical docs children only", rec.Result().StatusCode, bodyText)
 	}
 }
 

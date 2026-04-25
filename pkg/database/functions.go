@@ -544,6 +544,51 @@ func LoadPostRevisionsFromConfig(config Config.Settings, requestURI, domain stri
 	return posts, nil
 }
 
+// SaveRedirectFromConfig opens the configured database and upserts one active
+// redirect for an old URI/domain pair.
+func SaveRedirectFromConfig(config Config.Settings, redirect Data.Redirect) (Data.Redirect, error) {
+	dbConnection, err := connectToDb(config)
+	if err != nil {
+		return redirect, err
+	}
+	if dbConnection == nil {
+		return redirect, errors.New("database connection is nil")
+	}
+	defer dbConnection.Close()
+
+	return saveRedirectInDB(dbConnection, redirect, config.DB_TYPE)
+}
+
+// LoadRedirectFromConfig returns the newest active redirect for an old
+// URI/domain pair.
+func LoadRedirectFromConfig(config Config.Settings, oldURI, domain string) (Data.Redirect, bool, error) {
+	dbConnection, err := connectToDb(config)
+	if err != nil {
+		return Data.Redirect{}, false, err
+	}
+	if dbConnection == nil {
+		return Data.Redirect{}, false, errors.New("database connection is nil")
+	}
+	defer dbConnection.Close()
+
+	row := dbConnection.QueryRow(
+		fmt.Sprintf(`SELECT COALESCE(Id, 0), COALESCE(OldUri, ''), COALESCE(NewUri, ''), COALESCE(Date, 0), COALESCE(Status, ''), COALESCE(Domain, '')
+			FROM Redirect
+			WHERE OldUri = %s AND Domain = %s AND Status = 'active'
+			ORDER BY Date DESC`, sqlPlaceholder(config.DB_TYPE, 1), sqlPlaceholder(config.DB_TYPE, 2)),
+		oldURI,
+		domain,
+	)
+	var redirect Data.Redirect
+	if err := row.Scan(&redirect.Id, &redirect.OldUri, &redirect.NewUri, &redirect.Date, &redirect.Status, &redirect.Domain); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Data.Redirect{}, false, nil
+		}
+		return Data.Redirect{}, false, err
+	}
+	return redirect, true, nil
+}
+
 // SavePostDataInDB - функция для сохранения данных структуры Post в базу данных.
 func SavePostDataInDB(databaseConnection *sql.DB, post Data.Post, dbTypes ...string) (err error) {
 	dbType := "sqlite"
@@ -553,6 +598,68 @@ func SavePostDataInDB(databaseConnection *sql.DB, post Data.Post, dbTypes ...str
 
 	_, err = savePostDataInDB(databaseConnection, post, dbType)
 	return err
+}
+
+func saveRedirectInDB(databaseConnection *sql.DB, redirect Data.Redirect, dbType string) (Data.Redirect, error) {
+	if databaseConnection == nil {
+		return redirect, errors.New("database connection is nil")
+	}
+	if redirect.Status == "" {
+		redirect.Status = "active"
+	}
+	if redirect.Date == 0 {
+		redirect.Date = time.Now().UnixMilli()
+	}
+
+	tx, err := databaseConnection.Begin()
+	if err != nil {
+		return redirect, err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(
+		fmt.Sprintf("DELETE FROM Redirect WHERE OldUri = %s AND Domain = %s", sqlPlaceholder(dbType, 1), sqlPlaceholder(dbType, 2)),
+		redirect.OldUri,
+		redirect.Domain,
+	); err != nil {
+		return redirect, err
+	}
+
+	insertID := any(redirect.Id)
+	if redirect.Id == 0 {
+		if dbType == "sqlite" {
+			insertID = nil
+		} else {
+			redirect.Id, err = randomPostID()
+			if err != nil {
+				return redirect, err
+			}
+			insertID = redirect.Id
+		}
+	}
+
+	result, err := tx.Exec(
+		fmt.Sprintf("INSERT INTO Redirect (Id, OldUri, NewUri, Date, Status, Domain) VALUES (%s)", sqlPlaceholders(dbType, 6)),
+		insertID,
+		redirect.OldUri,
+		redirect.NewUri,
+		redirect.Date,
+		redirect.Status,
+		redirect.Domain,
+	)
+	if err != nil {
+		return redirect, err
+	}
+	if redirect.Id == 0 && dbType == "sqlite" {
+		redirect.Id, err = result.LastInsertId()
+		if err != nil {
+			return redirect, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return redirect, err
+	}
+	return redirect, nil
 }
 
 func savePostDataInDB(databaseConnection *sql.DB, post Data.Post, dbType string) (Data.Post, error) {

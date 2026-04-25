@@ -468,6 +468,48 @@ func TestSavePostRevisionFromConfigOpensDatabaseAndReturnsAssignedRevision(t *te
 	}
 }
 
+func TestSaveAndLoadRedirectFromConfigUpsertsByOldURIAndDomain(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "sitebrush-redirect.db")
+	cfg := Config.Settings{DB_TYPE: "sqlite", DB_FULL_FILE_PATH: dbPath}
+
+	saved, err := SaveRedirectFromConfig(cfg, Data.Redirect{
+		OldUri: "/old.html",
+		NewUri: "/new.html",
+		Domain: "example.test",
+		Status: "active",
+	})
+	if err != nil {
+		t.Fatalf("SaveRedirectFromConfig() first redirect: %v", err)
+	}
+	if saved.Id == 0 {
+		t.Fatal("saved redirect Id = 0, want database-assigned id")
+	}
+
+	if _, err := SaveRedirectFromConfig(cfg, Data.Redirect{
+		OldUri: "/old.html",
+		NewUri: "/newer.html",
+		Domain: "example.test",
+		Status: "active",
+	}); err != nil {
+		t.Fatalf("SaveRedirectFromConfig() upsert redirect: %v", err)
+	}
+
+	redirect, ok, err := LoadRedirectFromConfig(cfg, "/old.html", "example.test")
+	if err != nil {
+		t.Fatalf("LoadRedirectFromConfig(): %v", err)
+	}
+	if !ok {
+		t.Fatal("LoadRedirectFromConfig() ok = false, want true")
+	}
+	if redirect.OldUri != "/old.html" || redirect.NewUri != "/newer.html" || redirect.Domain != "example.test" || redirect.Status != "active" {
+		t.Fatalf("loaded redirect = %+v, want upserted active redirect", redirect)
+	}
+
+	if _, ok, err := LoadRedirectFromConfig(cfg, "/old.html", "other.test"); err != nil || ok {
+		t.Fatalf("LoadRedirectFromConfig() other domain ok=%v err=%v, want false/nil", ok, err)
+	}
+}
+
 func TestSavePostDataInDBAllocatesUniqueRevisionsDuringConcurrentSQLiteSaves(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "sitebrush-concurrent.db")
 	db, err := sql.Open("sqlite", dbPath)
