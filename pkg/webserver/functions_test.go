@@ -54,6 +54,63 @@ func writeFixtureFile(t *testing.T, root, name, body string) {
 	}
 }
 
+func TestHealthRouteReportsReadyWhenRootsAreUsable(t *testing.T) {
+	root := t.TempDir()
+	cfg := testConfig(t, root)
+
+	for _, target := range []string{healthzPath, "/?health"} {
+		t.Run(target, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, target, nil)
+			rec := httptest.NewRecorder()
+
+			handleRequest(cfg, rec, req)
+
+			if rec.Result().StatusCode != http.StatusOK {
+				t.Fatalf("health status = %d, want %d", rec.Result().StatusCode, http.StatusOK)
+			}
+			var response healthResponse
+			if err := json.NewDecoder(rec.Result().Body).Decode(&response); err != nil {
+				t.Fatalf("decode health response: %v", err)
+			}
+			if response.Status != "ok" {
+				t.Fatalf("health response status = %q, want ok", response.Status)
+			}
+		})
+	}
+}
+
+func TestHealthRouteReturnsUnavailableWithoutLeakingPaths(t *testing.T) {
+	root := t.TempDir()
+	webRootFile := filepath.Join(root, "not-a-directory")
+	if err := os.WriteFile(webRootFile, []byte("not a directory"), 0o644); err != nil {
+		t.Fatalf("write web root file: %v", err)
+	}
+	cfg := testConfig(t, webRootFile)
+
+	req := httptest.NewRequest(http.MethodGet, healthzPath, nil)
+	rec := httptest.NewRecorder()
+
+	handleRequest(cfg, rec, req)
+
+	if rec.Result().StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("health status = %d, want %d", rec.Result().StatusCode, http.StatusServiceUnavailable)
+	}
+	body, err := io.ReadAll(rec.Result().Body)
+	if err != nil {
+		t.Fatalf("read health body: %v", err)
+	}
+	if strings.Contains(string(body), root) || strings.Contains(string(body), webRootFile) {
+		t.Fatalf("health response leaked local paths: %q", string(body))
+	}
+	var response healthResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		t.Fatalf("decode health response: %v", err)
+	}
+	if response.Status != "unavailable" {
+		t.Fatalf("health response status = %q, want unavailable", response.Status)
+	}
+}
+
 func TestSafeRequestedFilePathResolvesIndexAndFilesInsideRoot(t *testing.T) {
 	root := t.TempDir()
 	cfg := testConfig(t, root)

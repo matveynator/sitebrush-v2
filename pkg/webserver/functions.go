@@ -38,6 +38,7 @@ const (
 	sessionCookieName = "sitebrush_session"
 	sessionDuration   = 12 * time.Hour
 	defaultDBDomain   = "default"
+	healthzPath       = "/sitebrush-healthz"
 )
 
 var errUnsafePath = errors.New("unsafe path")
@@ -93,6 +94,10 @@ type backupRecord struct {
 	Checksum  string    `json:"checksum"`
 	Size      int64     `json:"size"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+type healthResponse struct {
+	Status string `json:"status"`
 }
 
 type restoreRollbackEntry struct {
@@ -1707,6 +1712,11 @@ func handleRequest(config Config.Settings, responseWriter http.ResponseWriter, r
 }
 
 func (s siteService) handle(responseWriter http.ResponseWriter, request *http.Request) {
+	if request.URL.Path == healthzPath {
+		s.health(responseWriter, request)
+		return
+	}
+
 	if s.handleLegacyStatic(responseWriter, request) {
 		return
 	}
@@ -1776,6 +1786,8 @@ func (s siteService) handle(responseWriter http.ResponseWriter, request *http.Re
 		s.profile(responseWriter, request)
 	case "logout":
 		s.logout(responseWriter, request)
+	case "health":
+		s.health(responseWriter, request)
 	case "join":
 		s.join(responseWriter, request)
 	case "recover":
@@ -1791,6 +1803,71 @@ func (s siteService) handle(responseWriter http.ResponseWriter, request *http.Re
 	default:
 		http.Error(responseWriter, "Not Found", http.StatusNotFound)
 	}
+}
+
+func (s siteService) health(responseWriter http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodGet && request.Method != http.MethodHead {
+		responseWriter.Header().Set("Allow", "GET, HEAD")
+		http.Error(responseWriter, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	status := http.StatusOK
+	body := healthResponse{Status: "ok"}
+	if err := s.checkReadiness(); err != nil {
+		status = http.StatusServiceUnavailable
+		body.Status = "unavailable"
+	}
+
+	responseWriter.Header().Set("Cache-Control", "no-store")
+	responseWriter.Header().Set("Content-Type", "application/json")
+	responseWriter.WriteHeader(status)
+	if request.Method == http.MethodHead {
+		return
+	}
+	_ = json.NewEncoder(responseWriter).Encode(body)
+}
+
+func (s siteService) checkReadiness() error {
+	if err := ensureUsableDirectory(s.config.WEB_FILE_PATH); err != nil {
+		return err
+	}
+	if err := ensureUsableDirectory(s.archiveRoot()); err != nil {
+		return err
+	}
+	return nil
+}
+
+func ensureUsableDirectory(path string) error {
+	if path == "" {
+		path = "."
+	}
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return errors.New("path is not a directory")
+	}
+
+	probePath := filepath.Join(path, fmt.Sprintf(".sitebrush-healthz-%d-%d", os.Getpid(), time.Now().UnixNano()))
+	probe, err := os.OpenFile(probePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := probe.Write([]byte("ok\n")); err != nil {
+		_ = probe.Close()
+		_ = os.Remove(probePath)
+		return err
+	}
+	if err := probe.Close(); err != nil {
+		_ = os.Remove(probePath)
+		return err
+	}
+	return os.Remove(probePath)
 }
 
 func (s siteService) handleLegacyStatic(responseWriter http.ResponseWriter, request *http.Request) bool {
@@ -1882,7 +1959,7 @@ func parseAction(rawQuery string) (string, error) {
 			return "", errors.New("invalid query")
 		}
 		switch key {
-		case "login", "edit", "delete", "revisions", "subpages", "properties", "freeze", "unfreeze", "backup", "profile", "logout",
+		case "login", "edit", "delete", "revisions", "subpages", "properties", "freeze", "unfreeze", "backup", "profile", "logout", "health",
 			"join", "verify", "recover", "grab", "domains", "undelete", "captcha":
 			return key, nil
 		default:

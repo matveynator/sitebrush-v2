@@ -1,0 +1,37 @@
+.git
+.github
+
+# Local/editor state
+.DS_Store
+.idea
+.vscode
+
+# Build outputs and packaged artifacts
+bin/
+dist/
+build/
+out/
+sitebrush
+sitebrush.exe
+*.test
+*.prof
+*.cover
+coverage.*
+
+# Runtime/session data
+public_html/
+sitebrush-archives/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+
+# Temporary and log files
+tmp/
+temp/
+*.tmp
+*.log
+
+# Copilot/session artifacts that are not source inputs
+.copilot/
+session-state/
