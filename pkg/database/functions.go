@@ -1,16 +1,58 @@
 package database
 
 import (
+	"crypto/rand"
 	"database/sql"
 	"errors"
 	"fmt"
 	"log"
+	"math/big"
 	"strings"
+	"sync"
 	"time"
 
 	"sitebrush/pkg/config"
 	"sitebrush/pkg/data"
 )
+
+var postRevisionAllocationLocks = newPostRevisionKeyedMutex()
+
+type postRevisionKeyedMutex struct {
+	mu    sync.Mutex
+	locks map[string]*postRevisionKeyedLock
+}
+
+type postRevisionKeyedLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func newPostRevisionKeyedMutex() *postRevisionKeyedMutex {
+	return &postRevisionKeyedMutex{locks: map[string]*postRevisionKeyedLock{}}
+}
+
+func (k *postRevisionKeyedMutex) lock(key string) func() {
+	k.mu.Lock()
+	lock := k.locks[key]
+	if lock == nil {
+		lock = &postRevisionKeyedLock{}
+		k.locks[key] = lock
+	}
+	lock.refs++
+	k.mu.Unlock()
+
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+
+		k.mu.Lock()
+		lock.refs--
+		if lock.refs == 0 {
+			delete(k.locks, key)
+		}
+		k.mu.Unlock()
+	}
+}
 
 func connectToDb(config Config.Settings) (db *sql.DB, err error) {
 	if config.DB_TYPE == "genji" {
@@ -155,6 +197,9 @@ func createTables(db *sql.DB, config Config.Settings) (err error) {
 		return
 	}
 	if err = ensurePostColumns(db, config.DB_TYPE); err != nil {
+		return
+	}
+	if err = ensurePostRevisionIndex(db, config.DB_TYPE); err != nil {
 		return
 	}
 
@@ -381,6 +426,14 @@ func ensurePostColumns(db *sql.DB, dbType string) error {
 	return nil
 }
 
+func ensurePostRevisionIndex(db *sql.DB, dbType string) error {
+	if dbType == "genji" {
+		return nil
+	}
+	_, err := db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_post_domain_requesturi_revision ON Post (Domain, RequestUri, Revision)")
+	return err
+}
+
 func ensureBackupColumns(db *sql.DB, dbType string) error {
 	if dbType == "genji" {
 		return nil
@@ -417,6 +470,80 @@ func isDuplicateColumnError(err error) bool {
 		strings.Contains(message, "duplicate_column")
 }
 
+// SavePostRevisionFromConfig opens the configured database, ensures the schema
+// exists, and synchronously stores an immutable Post revision. It returns the
+// saved Post with Id and Revision fields populated.
+func SavePostRevisionFromConfig(config Config.Settings, post Data.Post) (Data.Post, error) {
+	dbConnection, err := connectToDb(config)
+	if err != nil {
+		return post, err
+	}
+	if dbConnection == nil {
+		return post, errors.New("database connection is nil")
+	}
+	defer dbConnection.Close()
+
+	return savePostDataInDB(dbConnection, post, config.DB_TYPE)
+}
+
+// LoadPostRevisionsFromConfig returns DB-backed Post revisions for one
+// request/domain pair. It intentionally filters to the requested page so callers
+// can acknowledge DB-backed revisions without needing a full-site DB listing.
+func LoadPostRevisionsFromConfig(config Config.Settings, requestURI, domain string) ([]Data.Post, error) {
+	dbConnection, err := connectToDb(config)
+	if err != nil {
+		return nil, err
+	}
+	if dbConnection == nil {
+		return nil, errors.New("database connection is nil")
+	}
+	defer dbConnection.Close()
+
+	rows, err := dbConnection.Query(
+		fmt.Sprintf(`SELECT COALESCE(Id, 0), COALESCE(OwnerId, 0), COALESCE(EditorId, 0), COALESCE(DeleterId, 0), COALESCE(RequestUri, ''), COALESCE(Type, ''), COALESCE(Date, 0), COALESCE(Title, ''), COALESCE(Body, ''), COALESCE(Header, ''), COALESCE(Summary, ''), COALESCE(ShortText, ''), COALESCE(Tags, ''), COALESCE(Revision, 0), COALESCE(Domain, ''), COALESCE(Status, ''), COALESCE(Published, false)
+			FROM Post
+			WHERE RequestUri = %s AND Domain = %s
+			ORDER BY Revision`, sqlPlaceholder(config.DB_TYPE, 1), sqlPlaceholder(config.DB_TYPE, 2)),
+		requestURI,
+		domain,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	posts := []Data.Post{}
+	for rows.Next() {
+		var post Data.Post
+		if err := rows.Scan(
+			&post.Id,
+			&post.OwnerId,
+			&post.EditorId,
+			&post.DeleterId,
+			&post.RequestUri,
+			&post.Type,
+			&post.Date,
+			&post.Title,
+			&post.Body,
+			&post.Header,
+			&post.Summary,
+			&post.ShortText,
+			&post.Tags,
+			&post.Revision,
+			&post.Domain,
+			&post.Status,
+			&post.Published,
+		); err != nil {
+			return nil, err
+		}
+		posts = append(posts, post)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return posts, nil
+}
+
 // SavePostDataInDB - функция для сохранения данных структуры Post в базу данных.
 func SavePostDataInDB(databaseConnection *sql.DB, post Data.Post, dbTypes ...string) (err error) {
 	dbType := "sqlite"
@@ -424,27 +551,49 @@ func SavePostDataInDB(databaseConnection *sql.DB, post Data.Post, dbTypes ...str
 		dbType = dbTypes[0]
 	}
 
-	// Переменная для подсчета количества записей с указанным RequestUri.
-	var count int
+	_, err = savePostDataInDB(databaseConnection, post, dbType)
+	return err
+}
 
-	// Пытаемся получить количество записей с таким же RequestUri, как у переданного post.
-	err = databaseConnection.QueryRow(
-		fmt.Sprintf("SELECT COUNT(*) FROM Post WHERE RequestUri = %s and Domain = %s", sqlPlaceholder(dbType, 1), sqlPlaceholder(dbType, 2)),
+func savePostDataInDB(databaseConnection *sql.DB, post Data.Post, dbType string) (Data.Post, error) {
+	if databaseConnection == nil {
+		return post, errors.New("database connection is nil")
+	}
+
+	unlock := postRevisionAllocationLocks.lock(post.Domain + "\x00" + post.RequestUri)
+	defer unlock()
+
+	tx, err := databaseConnection.Begin()
+	if err != nil {
+		return post, err
+	}
+	defer tx.Rollback()
+
+	if err := tx.QueryRow(
+		fmt.Sprintf("SELECT COALESCE(MAX(Revision), 0) + 1 FROM Post WHERE RequestUri = %s and Domain = %s", sqlPlaceholder(dbType, 1), sqlPlaceholder(dbType, 2)),
 		post.RequestUri,
 		post.Domain,
-	).Scan(&count)
-
-	// Если произошла ошибка при выполнении запроса, возвращаем ошибку.
-	if err != nil {
-		return err
+	).Scan(&post.Revision); err != nil {
+		return post, err
 	}
-	//Подготавливаем номер ревизии:
-	post.Revision = count + 1
+
+	insertID := any(post.Id)
+	if post.Id == 0 {
+		if dbType == "sqlite" {
+			insertID = nil
+		} else {
+			post.Id, err = randomPostID()
+			if err != nil {
+				return post, err
+			}
+			insertID = post.Id
+		}
+	}
 
 	// Добавляем новую запись в таблицу Post с данными из структуры post.
-	_, err = databaseConnection.Exec(
+	result, err := tx.Exec(
 		fmt.Sprintf("INSERT INTO Post (Id, OwnerId, EditorId, DeleterId, RequestUri, Type, Date, Title, Body, Header, Summary, ShortText, Tags, Revision, Domain, Status, Published) VALUES (%s)", sqlPlaceholders(dbType, 17)),
-		post.Id,
+		insertID,
 		post.OwnerId,
 		post.EditorId,
 		post.DeleterId,
@@ -465,9 +614,27 @@ func SavePostDataInDB(databaseConnection *sql.DB, post Data.Post, dbTypes ...str
 
 	// Если при добавлении записи произошла ошибка, возвращаем эту ошибку.
 	if err != nil {
-		return err
+		return post, err
+	}
+	if post.Id == 0 && dbType == "sqlite" {
+		post.Id, err = result.LastInsertId()
+		if err != nil {
+			return post, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return post, err
 	}
 
 	// Если функция успешно выполнена, возвращаем nil (нет ошибки).
-	return nil
+	return post, nil
+}
+
+func randomPostID() (int64, error) {
+	max := new(big.Int).Lsh(big.NewInt(1), 62)
+	value, err := rand.Int(rand.Reader, max)
+	if err != nil {
+		return 0, err
+	}
+	return value.Int64() + 1, nil
 }

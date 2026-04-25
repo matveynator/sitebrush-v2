@@ -5,6 +5,7 @@ package webserver
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -170,6 +171,62 @@ func TestCanonicalHostRejectsUnsafeHosts(t *testing.T) {
 				t.Fatalf("canonicalHost(%q) = %q, nil error; want rejection", host, got)
 			}
 		})
+	}
+}
+
+func TestTrustedDBRevisionDomainUsesDefaultForUntrustedHosts(t *testing.T) {
+	t.Setenv("SITEBRUSH_ALLOWED_HOSTS", "")
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "attacker.example.test"
+
+	domain, trusted := trustedDBRevisionDomain(req)
+
+	if trusted {
+		t.Fatal("trustedDBRevisionDomain() trusted unconfigured public host")
+	}
+	if domain != defaultDBDomain {
+		t.Fatalf("domain = %q, want %q", domain, defaultDBDomain)
+	}
+}
+
+func TestTrustedDBRevisionDomainAllowsConfiguredHostsAndLocalDev(t *testing.T) {
+	t.Setenv("SITEBRUSH_ALLOWED_HOSTS", " Example.TEST:2444 ")
+	allowedReq := httptest.NewRequest(http.MethodGet, "/", nil)
+	allowedReq.Host = "example.test"
+	domain, trusted := trustedDBRevisionDomain(allowedReq)
+	if !trusted || domain != "example.test" {
+		t.Fatalf("allowed domain/trusted = %q/%v, want example.test/true", domain, trusted)
+	}
+
+	localReq := httptest.NewRequest(http.MethodGet, "/", nil)
+	localReq.Host = "127.0.0.1:2444"
+	localReq.RemoteAddr = "127.0.0.1:55244"
+	domain, trusted = trustedDBRevisionDomain(localReq)
+	if !trusted || domain != "127.0.0.1" {
+		t.Fatalf("local domain/trusted = %q/%v, want 127.0.0.1/true", domain, trusted)
+	}
+}
+
+func TestTrustedDBRevisionDomainRequiresLoopbackRemoteForImplicitLocalDev(t *testing.T) {
+	t.Setenv("SITEBRUSH_ALLOWED_HOSTS", "")
+
+	remoteReq := httptest.NewRequest(http.MethodGet, "/", nil)
+	remoteReq.Host = "localhost:2444"
+	remoteReq.RemoteAddr = "203.0.113.10:55244"
+	domain, trusted := trustedDBRevisionDomain(remoteReq)
+	if trusted {
+		t.Fatal("trustedDBRevisionDomain() trusted localhost host from non-loopback remote")
+	}
+	if domain != defaultDBDomain {
+		t.Fatalf("remote localhost domain = %q, want %q", domain, defaultDBDomain)
+	}
+
+	loopbackReq := httptest.NewRequest(http.MethodGet, "/", nil)
+	loopbackReq.Host = "localhost:2444"
+	loopbackReq.RemoteAddr = "127.0.0.1:55244"
+	domain, trusted = trustedDBRevisionDomain(loopbackReq)
+	if !trusted || domain != "localhost" {
+		t.Fatalf("loopback localhost domain/trusted = %q/%v, want localhost/true", domain, trusted)
 	}
 }
 
@@ -973,6 +1030,278 @@ func TestEditPostSavesAtomicallyAndCreatesRevision(t *testing.T) {
 	}
 	if revisionsRec.Result().StatusCode != http.StatusOK || !strings.Contains(string(body), "Revision 1") {
 		t.Fatalf("revisions status/body = %d/%q, want Revision 1", revisionsRec.Result().StatusCode, string(body))
+	}
+}
+
+func TestEditPostSavesDatabaseBackedPostRevisionWhenConfigured(t *testing.T) {
+	cfg, cookie, csrf := loginTestUser(t)
+	t.Setenv("SITEBRUSH_ALLOWED_HOSTS", "example.test")
+	cfg.DB_TYPE = "sqlite"
+	cfg.DB_FULL_FILE_PATH = filepath.Join(t.TempDir(), "sitebrush.db")
+	writeFixtureFile(t, cfg.WEB_FILE_PATH, "docs/page.html", "original")
+
+	form := url.Values{"content": {"changed in db"}, "csrf": {csrf}}
+	req := httptest.NewRequest(http.MethodPost, "/docs/page.html?edit", strings.NewReader(form.Encode()))
+	req.Host = "Example.TEST:2444"
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+
+	handleRequest(cfg, rec, req)
+
+	if rec.Result().StatusCode != http.StatusSeeOther {
+		t.Fatalf("status = %d, want %d", rec.Result().StatusCode, http.StatusSeeOther)
+	}
+
+	db, err := sql.Open("sqlite", cfg.DB_FULL_FILE_PATH)
+	if err != nil {
+		t.Fatalf("open edit db: %v", err)
+	}
+	defer db.Close()
+
+	var requestURI, domain, body, status, postType string
+	var revision int
+	var published bool
+	if err := db.QueryRow(`SELECT RequestUri, Domain, Body, Status, Published, Revision, Type
+		FROM Post
+		WHERE RequestUri = ? AND Domain = ?`, "/docs/page.html", "example.test").Scan(&requestURI, &domain, &body, &status, &published, &revision, &postType); err != nil {
+		t.Fatalf("query saved post revision: %v", err)
+	}
+	if requestURI != "/docs/page.html" || domain != "example.test" || body != "changed in db" {
+		t.Fatalf("saved post content = uri:%q domain:%q body:%q", requestURI, domain, body)
+	}
+	if status != "active" || !published || revision != 1 || postType != "Wiki" {
+		t.Fatalf("saved post metadata status=%q published=%v revision=%d type=%q, want active true 1 Wiki", status, published, revision, postType)
+	}
+
+	revisionsReq := httptest.NewRequest(http.MethodGet, "/docs/page.html?revisions", nil)
+	revisionsReq.Host = "Example.TEST:2444"
+	revisionsReq.AddCookie(cookie)
+	revisionsRec := httptest.NewRecorder()
+	handleRequest(cfg, revisionsRec, revisionsReq)
+	bodyBytes, err := io.ReadAll(revisionsRec.Result().Body)
+	if err != nil {
+		t.Fatalf("read revisions body: %v", err)
+	}
+	if revisionsRec.Result().StatusCode != http.StatusOK || !strings.Contains(string(bodyBytes), "Database-backed revisions") || !strings.Contains(string(bodyBytes), "DB Revision 1 active published") {
+		t.Fatalf("revisions status/body = %d/%q, want DB revision metadata", revisionsRec.Result().StatusCode, string(bodyBytes))
+	}
+}
+
+func TestEditPostSurfacesDatabaseWriteFailureAfterFileSave(t *testing.T) {
+	cfg, cookie, csrf := loginTestUser(t)
+	cfg.DB_TYPE = "sqlite"
+	cfg.DB_FULL_FILE_PATH = filepath.Join(t.TempDir(), "missing-parent", "sitebrush.db")
+	writeFixtureFile(t, cfg.WEB_FILE_PATH, "index.html", "original")
+
+	form := url.Values{"content": {"changed before db failure"}, "csrf": {csrf}}
+	req := httptest.NewRequest(http.MethodPost, "/?edit", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+
+	handleRequest(cfg, rec, req)
+
+	if rec.Result().StatusCode != http.StatusSeeOther {
+		t.Fatalf("status = %d, want %d", rec.Result().StatusCode, http.StatusSeeOther)
+	}
+	data, err := os.ReadFile(filepath.Join(cfg.WEB_FILE_PATH, "index.html"))
+	if err != nil {
+		t.Fatalf("read saved file: %v", err)
+	}
+	if string(data) != "changed before db failure" {
+		t.Fatalf("file content = %q, want changed before db failure", string(data))
+	}
+	if _, err := os.Stat(cfg.DB_FULL_FILE_PATH); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("db path stat error = %v, want not exist", err)
+	}
+	service := siteService{config: cfg, sessions: defaultSessions}
+	records, err := service.loadRevisions("/")
+	if err != nil {
+		t.Fatalf("load revisions after db failure: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("revision records = %d, want 1", len(records))
+	}
+	if !strings.Contains(records[0].DBRevisionWarning, "database post revision was not saved") {
+		t.Fatalf("DBRevisionWarning = %q, want database warning marker", records[0].DBRevisionWarning)
+	}
+}
+
+func TestEditPostUsesDefaultDomainForUntrustedDBRevisionHost(t *testing.T) {
+	cfg, cookie, csrf := loginTestUser(t)
+	t.Setenv("SITEBRUSH_ALLOWED_HOSTS", "")
+	cfg.DB_TYPE = "sqlite"
+	cfg.DB_FULL_FILE_PATH = filepath.Join(t.TempDir(), "sitebrush.db")
+	writeFixtureFile(t, cfg.WEB_FILE_PATH, "index.html", "original")
+
+	form := url.Values{"content": {"changed with untrusted host"}, "csrf": {csrf}}
+	req := httptest.NewRequest(http.MethodPost, "/?edit", strings.NewReader(form.Encode()))
+	req.Host = "attacker.example.test"
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+
+	handleRequest(cfg, rec, req)
+
+	if rec.Result().StatusCode != http.StatusSeeOther {
+		t.Fatalf("status = %d, want %d", rec.Result().StatusCode, http.StatusSeeOther)
+	}
+	db, err := sql.Open("sqlite", cfg.DB_FULL_FILE_PATH)
+	if err != nil {
+		t.Fatalf("open edit db: %v", err)
+	}
+	defer db.Close()
+	var domain string
+	if err := db.QueryRow("SELECT Domain FROM Post WHERE RequestUri = ?", "/").Scan(&domain); err != nil {
+		t.Fatalf("query saved domain: %v", err)
+	}
+	if domain != defaultDBDomain {
+		t.Fatalf("saved domain = %q, want %q", domain, defaultDBDomain)
+	}
+}
+
+func TestEditPostNormalizesEncodedPathForDBAndJSONRevisions(t *testing.T) {
+	cfg, cookie, csrf := loginTestUser(t)
+	cfg.DB_TYPE = "sqlite"
+	cfg.DB_FULL_FILE_PATH = filepath.Join(t.TempDir(), "sitebrush.db")
+	writeFixtureFile(t, cfg.WEB_FILE_PATH, "docs/page.html", "original")
+
+	form := url.Values{"content": {"changed via encoded path"}, "csrf": {csrf}}
+	req := httptest.NewRequest(http.MethodPost, "/docs/%70age.html?edit", strings.NewReader(form.Encode()))
+	req.Host = "localhost:2444"
+	req.RemoteAddr = "127.0.0.1:55244"
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+
+	handleRequest(cfg, rec, req)
+
+	if rec.Result().StatusCode != http.StatusSeeOther {
+		t.Fatalf("status = %d, want %d", rec.Result().StatusCode, http.StatusSeeOther)
+	}
+	db, err := sql.Open("sqlite", cfg.DB_FULL_FILE_PATH)
+	if err != nil {
+		t.Fatalf("open edit db: %v", err)
+	}
+	defer db.Close()
+	var requestURI string
+	if err := db.QueryRow("SELECT RequestUri FROM Post WHERE Domain = ?", "localhost").Scan(&requestURI); err != nil {
+		t.Fatalf("query saved request uri: %v", err)
+	}
+	if requestURI != "/docs/page.html" {
+		t.Fatalf("saved request uri = %q, want /docs/page.html", requestURI)
+	}
+
+	service := siteService{config: cfg, sessions: defaultSessions}
+	records, err := service.loadRevisions("/docs/page.html")
+	if err != nil {
+		t.Fatalf("load canonical revisions: %v", err)
+	}
+	if len(records) != 1 || records[0].RequestURI != "/docs/page.html" {
+		t.Fatalf("canonical revision records = %+v, want one /docs/page.html record", records)
+	}
+	aliasRecords, err := service.loadRevisions("/docs/%70age.html")
+	if err != nil {
+		t.Fatalf("load alias revisions: %v", err)
+	}
+	if len(aliasRecords) != 0 {
+		t.Fatalf("alias revision records = %+v, want none", aliasRecords)
+	}
+}
+
+func TestConcurrentAuthenticatedEditsCreateConsecutiveJSONRevisions(t *testing.T) {
+	cfg, cookie, csrf := loginTestUser(t)
+	writeFixtureFile(t, cfg.WEB_FILE_PATH, "docs/page.html", "original")
+
+	contents := []string{"first concurrent change", "second concurrent change"}
+	start := make(chan struct{})
+	statuses := make(chan int, len(contents))
+	var wg sync.WaitGroup
+	for _, content := range contents {
+		content := content
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			form := url.Values{"content": {content}, "csrf": {csrf}}
+			req := httptest.NewRequest(http.MethodPost, "/docs/page.html?edit", strings.NewReader(form.Encode()))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req.AddCookie(cookie)
+			rec := httptest.NewRecorder()
+
+			handleRequest(cfg, rec, req)
+			statuses <- rec.Result().StatusCode
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(statuses)
+
+	for status := range statuses {
+		if status != http.StatusSeeOther {
+			t.Fatalf("concurrent edit status = %d, want %d", status, http.StatusSeeOther)
+		}
+	}
+
+	service := siteService{config: cfg, sessions: defaultSessions}
+	records, err := service.loadRevisions("/docs/page.html")
+	if err != nil {
+		t.Fatalf("load revisions: %v", err)
+	}
+	if len(records) != len(contents) {
+		t.Fatalf("revision records = %+v, want %d records", records, len(contents))
+	}
+	seenAfterContent := map[string]bool{}
+	for i, record := range records {
+		if record.Revision != i+1 {
+			t.Fatalf("revision records = %+v, want consecutive revisions 1..%d", records, len(contents))
+		}
+		seenAfterContent[record.AfterContent] = true
+	}
+	for _, content := range contents {
+		if !seenAfterContent[content] {
+			t.Fatalf("revision after_content set = %v, missing %q", seenAfterContent, content)
+		}
+	}
+
+	entries, err := os.ReadDir(service.revisionDir("/docs/page.html"))
+	if err != nil {
+		t.Fatalf("read revision dir: %v", err)
+	}
+	jsonFiles := 0
+	names := map[string]bool{}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		jsonFiles++
+		if names[entry.Name()] {
+			t.Fatalf("duplicate revision filename %q", entry.Name())
+		}
+		names[entry.Name()] = true
+	}
+	if jsonFiles != len(contents) {
+		t.Fatalf("json revision file count = %d (%v), want %d", jsonFiles, names, len(contents))
+	}
+
+	data, err := os.ReadFile(filepath.Join(cfg.WEB_FILE_PATH, "docs", "page.html"))
+	if err != nil {
+		t.Fatalf("read saved file: %v", err)
+	}
+	if !seenAfterContent[string(data)] {
+		t.Fatalf("final file content = %q, want one of saved revision contents %v", string(data), seenAfterContent)
+	}
+}
+
+func TestDBPostRevisionConfiguredSupportsPostgresWithoutFilePath(t *testing.T) {
+	service := siteService{config: Config.Settings{DB_TYPE: "postgres"}}
+	if !service.dbPostRevisionConfigured() {
+		t.Fatal("postgres DB revisions should not require DB_FULL_FILE_PATH")
+	}
+	service = siteService{config: Config.Settings{DB_TYPE: "sqlite"}}
+	if service.dbPostRevisionConfigured() {
+		t.Fatal("sqlite DB revisions should require DB_FULL_FILE_PATH")
 	}
 }
 

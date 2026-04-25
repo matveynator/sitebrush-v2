@@ -6,6 +6,8 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"sort"
+	"sync"
 	"testing"
 
 	Config "sitebrush/pkg/config"
@@ -254,6 +256,37 @@ func TestCreateTablesAddsMissingPostColumns(t *testing.T) {
 	assertColumnsExist(t, columns, "OwnerId", "EditorId", "DeleterId", "Type", "Date", "Body", "Header", "Summary", "ShortText", "Tags", "Revision", "Domain", "Status", "Published")
 }
 
+func TestCreateTablesCreatesPostRevisionUniqueIndex(t *testing.T) {
+	db := openTestSQLiteDB(t)
+
+	rows, err := db.Query("PRAGMA index_list(Post)")
+	if err != nil {
+		t.Fatalf("list Post indexes: %v", err)
+	}
+	defer rows.Close()
+
+	found := false
+	for rows.Next() {
+		var seq int
+		var name string
+		var unique int
+		var origin string
+		var partial int
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			t.Fatalf("scan index: %v", err)
+		}
+		if name == "idx_post_domain_requesturi_revision" && unique == 1 {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate indexes: %v", err)
+	}
+	if !found {
+		t.Fatal("Post revision unique index was not created")
+	}
+}
+
 func TestCreateTablesAddsMissingBackupColumns(t *testing.T) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
@@ -375,6 +408,164 @@ func TestSavePostDataInDBAssignsSequentialRevisionsPerDomainAndURI(t *testing.T)
 				}
 			}
 		})
+	}
+}
+
+func TestSavePostRevisionFromConfigOpensDatabaseAndReturnsAssignedRevision(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "sitebrush.db")
+	cfg := Config.Settings{DB_TYPE: "sqlite", DB_FULL_FILE_PATH: dbPath}
+
+	saved, err := SavePostRevisionFromConfig(cfg, Data.Post{
+		RequestUri: "/about/",
+		Domain:     "example.test",
+		Type:       "Wiki",
+		Title:      "About",
+		Body:       "first body",
+		Status:     "active",
+		Published:  true,
+	})
+	if err != nil {
+		t.Fatalf("SavePostRevisionFromConfig() first revision: %v", err)
+	}
+	if saved.Id == 0 {
+		t.Fatal("saved post Id = 0, want database-assigned id")
+	}
+	if saved.Revision != 1 {
+		t.Fatalf("saved revision = %d, want 1", saved.Revision)
+	}
+
+	saved, err = SavePostRevisionFromConfig(cfg, Data.Post{
+		RequestUri: "/about/",
+		Domain:     "example.test",
+		Type:       "Wiki",
+		Title:      "About",
+		Body:       "second body",
+		Status:     "active",
+		Published:  true,
+	})
+	if err != nil {
+		t.Fatalf("SavePostRevisionFromConfig() second revision: %v", err)
+	}
+	if saved.Revision != 2 {
+		t.Fatalf("second saved revision = %d, want 2", saved.Revision)
+	}
+
+	posts, err := LoadPostRevisionsFromConfig(cfg, "/about/", "example.test")
+	if err != nil {
+		t.Fatalf("LoadPostRevisionsFromConfig(): %v", err)
+	}
+	if len(posts) != 2 {
+		t.Fatalf("loaded posts = %d, want 2", len(posts))
+	}
+	if posts[0].Id == 0 || posts[1].Id == 0 || posts[0].Id == posts[1].Id {
+		t.Fatalf("loaded post IDs = %d/%d, want distinct non-zero IDs", posts[0].Id, posts[1].Id)
+	}
+	if posts[0].Body != "first body" || posts[1].Body != "second body" {
+		t.Fatalf("loaded post bodies = %q/%q, want first body/second body", posts[0].Body, posts[1].Body)
+	}
+	if !posts[0].Published || posts[0].Status != "active" || posts[0].Type != "Wiki" {
+		t.Fatalf("first post metadata = %+v, want active published Wiki", posts[0])
+	}
+}
+
+func TestSavePostDataInDBAllocatesUniqueRevisionsDuringConcurrentSQLiteSaves(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "sitebrush-concurrent.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(8)
+	if _, err := db.Exec("PRAGMA busy_timeout = 5000"); err != nil {
+		t.Fatalf("set busy timeout: %v", err)
+	}
+	if err := createTables(db, Config.Settings{DB_TYPE: "sqlite", DB_FULL_FILE_PATH: dbPath}); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+
+	const saves = 12
+	start := make(chan struct{})
+	errs := make(chan error, saves)
+	var wg sync.WaitGroup
+	for i := 0; i < saves; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, err := savePostDataInDB(db, Data.Post{
+				RequestUri: "/same/page.html",
+				Domain:     "example.test",
+				Title:      "concurrent",
+				Body:       "body",
+				Status:     "active",
+				Published:  true,
+			}, "sqlite")
+			errs <- err
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent save failed: %v", err)
+		}
+	}
+
+	rows, err := db.Query("SELECT Revision FROM Post WHERE Domain = ? AND RequestUri = ? ORDER BY Revision", "example.test", "/same/page.html")
+	if err != nil {
+		t.Fatalf("query revisions: %v", err)
+	}
+	defer rows.Close()
+	var got []int
+	for rows.Next() {
+		var revision int
+		if err := rows.Scan(&revision); err != nil {
+			t.Fatalf("scan revision: %v", err)
+		}
+		got = append(got, revision)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate revisions: %v", err)
+	}
+	sort.Ints(got)
+	if len(got) != saves {
+		t.Fatalf("saved revisions = %v, want %d revisions", got, saves)
+	}
+	for i, revision := range got {
+		if revision != i+1 {
+			t.Fatalf("saved revisions = %v, want consecutive 1..%d", got, saves)
+		}
+	}
+}
+
+func TestLoadPostRevisionsFromConfigHandlesLegacyNullableRows(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "sitebrush-nullable.db")
+	cfg := Config.Settings{DB_TYPE: "sqlite", DB_FULL_FILE_PATH: dbPath}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer db.Close()
+	if err := createTables(db, cfg); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	if _, err := db.Exec("INSERT INTO Post (RequestUri, Domain, Revision, Body, Published) VALUES (?, ?, ?, NULL, NULL)", "/legacy.html", "example.test", 1); err != nil {
+		t.Fatalf("insert nullable legacy row: %v", err)
+	}
+
+	posts, err := LoadPostRevisionsFromConfig(cfg, "/legacy.html", "example.test")
+	if err != nil {
+		t.Fatalf("LoadPostRevisionsFromConfig() with nullable row: %v", err)
+	}
+	if len(posts) != 1 {
+		t.Fatalf("loaded posts = %d, want 1", len(posts))
+	}
+	if posts[0].RequestUri != "/legacy.html" || posts[0].Domain != "example.test" || posts[0].Revision != 1 {
+		t.Fatalf("loaded post = %+v, want normalized nullable legacy row", posts[0])
+	}
+	if posts[0].Body != "" || posts[0].Published {
+		t.Fatalf("nullable fields body=%q published=%v, want empty/false", posts[0].Body, posts[0].Published)
 	}
 }
 

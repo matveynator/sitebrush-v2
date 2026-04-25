@@ -22,6 +22,8 @@ import (
 	pathpkg "path"
 	"path/filepath"
 	Config "sitebrush/pkg/config"
+	Data "sitebrush/pkg/data"
+	Database "sitebrush/pkg/database"
 	"sort"
 	"strings"
 	"sync"
@@ -34,6 +36,7 @@ import (
 const (
 	sessionCookieName = "sitebrush_session"
 	sessionDuration   = 12 * time.Hour
+	defaultDBDomain   = "default"
 )
 
 type siteService struct {
@@ -56,13 +59,25 @@ type sessionStore struct {
 }
 
 type revisionRecord struct {
-	Revision      int       `json:"revision"`
-	RequestURI    string    `json:"request_uri"`
-	Path          string    `json:"path"`
-	CreatedAt     time.Time `json:"created_at"`
-	BeforeContent string    `json:"before_content"`
-	AfterContent  string    `json:"after_content"`
-	Checksum      string    `json:"checksum"`
+	Revision          int       `json:"revision"`
+	RequestURI        string    `json:"request_uri"`
+	Path              string    `json:"path"`
+	CreatedAt         time.Time `json:"created_at"`
+	BeforeContent     string    `json:"before_content"`
+	AfterContent      string    `json:"after_content"`
+	Checksum          string    `json:"checksum"`
+	DBRevisionWarning string    `json:"db_revision_warning,omitempty"`
+}
+
+type dbRevisionMetadata struct {
+	Revision   int
+	RequestURI string
+	Domain     string
+	Type       string
+	Title      string
+	Status     string
+	Published  bool
+	CreatedAt  time.Time
 }
 
 type siteState struct {
@@ -78,6 +93,44 @@ type backupRecord struct {
 }
 
 var defaultSessions = newSessionStore()
+var revisionWriteLocks = newKeyedMutex()
+
+type keyedMutex struct {
+	mu    sync.Mutex
+	locks map[string]*keyedLock
+}
+
+type keyedLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func newKeyedMutex() *keyedMutex {
+	return &keyedMutex{locks: map[string]*keyedLock{}}
+}
+
+func (k *keyedMutex) lock(key string) func() {
+	k.mu.Lock()
+	lock := k.locks[key]
+	if lock == nil {
+		lock = &keyedLock{}
+		k.locks[key] = lock
+	}
+	lock.refs++
+	k.mu.Unlock()
+
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+
+		k.mu.Lock()
+		lock.refs--
+		if lock.refs == 0 {
+			delete(k.locks, key)
+		}
+		k.mu.Unlock()
+	}
+}
 
 func newSiteService(config Config.Settings) siteService {
 	return siteService{config: config, sessions: defaultSessions}
@@ -326,7 +379,7 @@ func (s siteService) edit(responseWriter http.ResponseWriter, request *http.Requ
 			return
 		}
 		newContent := request.FormValue("content")
-		if err := s.saveEditedFile(request, fileName, newContent); err != nil {
+		if err := s.saveEditedFile(request, session, fileName, newContent); err != nil {
 			http.Error(responseWriter, "Save failed", http.StatusInternalServerError)
 			return
 		}
@@ -337,7 +390,15 @@ func (s siteService) edit(responseWriter http.ResponseWriter, request *http.Requ
 	}
 }
 
-func (s siteService) saveEditedFile(request *http.Request, fileName, newContent string) error {
+func (s siteService) saveEditedFile(request *http.Request, session operatorSession, fileName, newContent string) error {
+	requestURI, err := s.canonicalRequestURIForFile(fileName)
+	if err != nil {
+		return err
+	}
+
+	unlock := revisionWriteLocks.lock(s.revisionLockKey(requestURI))
+	defer unlock()
+
 	oldContent := ""
 	if data, err := os.ReadFile(fileName); err == nil {
 		oldContent = string(data)
@@ -345,23 +406,87 @@ func (s siteService) saveEditedFile(request *http.Request, fileName, newContent 
 		return err
 	}
 
-	revision, err := s.nextRevision(request.URL.Path)
+	revision, err := s.nextRevision(requestURI)
 	if err != nil {
 		return err
 	}
 	record := revisionRecord{
 		Revision:      revision,
-		RequestURI:    request.URL.Path,
-		Path:          request.URL.Path,
+		RequestURI:    requestURI,
+		Path:          requestURI,
 		CreatedAt:     time.Now().UTC(),
 		BeforeContent: oldContent,
 		AfterContent:  newContent,
 		Checksum:      contentChecksum(newContent),
 	}
-	if err := s.writeRevision(record); err != nil {
+	revisionPath, err := s.writeRevision(record)
+	if err != nil {
 		return err
 	}
-	return atomicWriteFile(fileName, []byte(newContent), 0o644)
+	if err := atomicWriteFile(fileName, []byte(newContent), 0o644); err != nil {
+		return err
+	}
+	if err := s.saveDBPostRevision(request, session, record); err != nil {
+		warning := fmt.Sprintf("database post revision was not saved: %v", err)
+		log.Printf("SiteBrush DB revision warning for %s: %s", record.RequestURI, warning)
+		record.DBRevisionWarning = warning
+		if markerErr := s.writeRevisionAtPath(record, revisionPath); markerErr != nil {
+			log.Printf("SiteBrush DB revision warning marker failed for %s: %v", record.RequestURI, markerErr)
+		}
+	}
+	return nil
+}
+
+func (s siteService) saveDBPostRevision(request *http.Request, session operatorSession, record revisionRecord) error {
+	if !s.dbPostRevisionConfigured() {
+		return nil
+	}
+	domain, trusted := trustedDBRevisionDomain(request)
+	if !trusted {
+		log.Printf("SiteBrush DB revision using default domain for untrusted host %q", request.Host)
+	}
+	post := Data.Post{
+		OwnerId:    int(session.UserID),
+		EditorId:   int(session.UserID),
+		RequestUri: record.RequestURI,
+		Type:       "Wiki",
+		Date:       record.CreatedAt.UnixMilli(),
+		Title:      titleFromRequestURI(record.RequestURI),
+		Body:       record.AfterContent,
+		Tags:       "",
+		Domain:     domain,
+		Status:     "active",
+		Published:  true,
+	}
+	_, err := Database.SavePostRevisionFromConfig(s.config, post)
+	return err
+}
+
+func (s siteService) dbPostRevisionConfigured() bool {
+	switch s.config.DB_TYPE {
+	case "postgres":
+		return true
+	case "sqlite", "genji":
+		return s.config.DB_FULL_FILE_PATH != ""
+	default:
+		return false
+	}
+}
+
+func titleFromRequestURI(requestURI string) string {
+	cleaned := pathpkg.Clean("/" + strings.TrimPrefix(requestURI, "/"))
+	if cleaned == "/" || cleaned == "." {
+		return "Home"
+	}
+	base := pathpkg.Base(cleaned)
+	base = strings.TrimSuffix(base, pathpkg.Ext(base))
+	base = strings.ReplaceAll(base, "-", " ")
+	base = strings.ReplaceAll(base, "_", " ")
+	base = strings.TrimSpace(base)
+	if base == "" || base == "." {
+		return cleaned
+	}
+	return base
 }
 
 func atomicWriteFile(fileName string, data []byte, mode fs.FileMode) error {
@@ -431,15 +556,26 @@ func (s siteService) revisions(responseWriter http.ResponseWriter, request *http
 
 	switch request.Method {
 	case http.MethodGet:
-		records, err := s.loadRevisions(request.URL.Path)
+		requestURI, err := s.canonicalRequestURIForFile(fileName)
 		if err != nil {
 			http.Error(responseWriter, "Could not load revisions", http.StatusInternalServerError)
 			return
 		}
+		records, err := s.loadRevisions(requestURI)
+		if err != nil {
+			http.Error(responseWriter, "Could not load revisions", http.StatusInternalServerError)
+			return
+		}
+		dbRecords, err := s.loadDBRevisionMetadata(request, requestURI)
+		if err != nil {
+			http.Error(responseWriter, "Could not load database revisions", http.StatusInternalServerError)
+			return
+		}
 		renderHTML(responseWriter, "Revisions "+request.URL.Path, revisionsTemplate, map[string]any{
-			"Records": records,
-			"Action":  request.URL.Path + "?revisions",
-			"CSRF":    session.CSRFToken,
+			"Records":   records,
+			"DBRecords": dbRecords,
+			"Action":    request.URL.Path + "?revisions",
+			"CSRF":      session.CSRFToken,
 		})
 	case http.MethodPost:
 		if !s.validCSRF(request, session) {
@@ -455,12 +591,17 @@ func (s siteService) revisions(responseWriter http.ResponseWriter, request *http
 			http.Error(responseWriter, "Missing revision", http.StatusBadRequest)
 			return
 		}
-		record, err := s.findRevision(request.URL.Path, revision)
+		requestURI, err := s.canonicalRequestURIForFile(fileName)
 		if err != nil {
 			http.Error(responseWriter, "Revision not found", http.StatusNotFound)
 			return
 		}
-		if err := s.saveEditedFile(request, fileName, record.AfterContent); err != nil {
+		record, err := s.findRevision(requestURI, revision)
+		if err != nil {
+			http.Error(responseWriter, "Revision not found", http.StatusNotFound)
+			return
+		}
+		if err := s.saveEditedFile(request, session, fileName, record.AfterContent); err != nil {
 			http.Error(responseWriter, "Restore failed", http.StatusInternalServerError)
 			return
 		}
@@ -743,6 +884,40 @@ func safeRequestedFilePath(config Config.Settings, requestPath string) (string, 
 	return safePathUnderRoot(config.WEB_FILE_PATH, requestPath, config.WEB_INDEX_FILE, true)
 }
 
+func (s siteService) canonicalRequestURIForFile(fileName string) (string, error) {
+	rootPath, err := filepath.Abs(s.config.WEB_FILE_PATH)
+	if err != nil {
+		return "", err
+	}
+	targetPath, err := filepath.Abs(fileName)
+	if err != nil {
+		return "", err
+	}
+	if !pathIsInsideRoot(rootPath, targetPath) {
+		return "", errors.New("unsafe path")
+	}
+	relativePath, err := filepath.Rel(rootPath, targetPath)
+	if err != nil {
+		return "", err
+	}
+	relativeSlash := filepath.ToSlash(relativePath)
+	indexFile := s.config.WEB_INDEX_FILE
+	if indexFile == "" {
+		indexFile = "index.html"
+	}
+	if relativeSlash == indexFile {
+		return "/", nil
+	}
+	if pathpkg.Base(relativeSlash) == indexFile {
+		dir := pathpkg.Dir(relativeSlash)
+		if dir == "." {
+			return "/", nil
+		}
+		return "/" + strings.Trim(dir, "/") + "/", nil
+	}
+	return "/" + strings.TrimPrefix(relativeSlash, "/"), nil
+}
+
 func safePathUnderRoot(root, requestPath, indexFile string, appendIndex bool) (string, error) {
 	if requestPath == "" {
 		requestPath = "/"
@@ -818,6 +993,52 @@ func canonicalHostFromRequest(request *http.Request) (string, error) {
 		return "", errors.New("missing request")
 	}
 	return canonicalHost(request.Host)
+}
+
+func trustedDBRevisionDomain(request *http.Request) (string, bool) {
+	host, err := canonicalHostFromRequest(request)
+	if err != nil {
+		return defaultDBDomain, false
+	}
+	for _, allowedHost := range strings.Split(os.Getenv("SITEBRUSH_ALLOWED_HOSTS"), ",") {
+		allowedHost = strings.TrimSpace(allowedHost)
+		if allowedHost == "" {
+			continue
+		}
+		canonicalAllowedHost, err := canonicalHost(allowedHost)
+		if err != nil {
+			log.Printf("SiteBrush ignoring invalid SITEBRUSH_ALLOWED_HOSTS entry %q: %v", allowedHost, err)
+			continue
+		}
+		if canonicalAllowedHost == host {
+			return host, true
+		}
+	}
+	if isLocalDevHost(host) && isLoopbackRemoteAddr(request.RemoteAddr) {
+		return host, true
+	}
+	return defaultDBDomain, false
+}
+
+func isLocalDevHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func isLoopbackRemoteAddr(remoteAddr string) bool {
+	if remoteAddr == "" {
+		return false
+	}
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	host = strings.Trim(host, "[]")
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func canonicalHost(host string) (string, error) {
@@ -1134,25 +1355,74 @@ func (s siteService) revisionDir(requestURI string) string {
 	return filepath.Join(s.archiveRoot(), "revisions", safeName)
 }
 
+func (s siteService) revisionLockKey(requestURI string) string {
+	return filepath.Clean(s.revisionDir(requestURI))
+}
+
 func (s siteService) nextRevision(requestURI string) (int, error) {
 	records, err := s.loadRevisions(requestURI)
 	if err != nil {
 		return 0, err
 	}
-	return len(records) + 1, nil
+	maxRevision := 0
+	for _, record := range records {
+		if record.Revision > maxRevision {
+			maxRevision = record.Revision
+		}
+	}
+	return maxRevision + 1, nil
 }
 
-func (s siteService) writeRevision(record revisionRecord) error {
+func (s siteService) writeRevision(record revisionRecord) (string, error) {
+	data, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	dir := s.revisionDir(record.RequestURI)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	for attempt := 0; attempt < 16; attempt++ {
+		suffix, err := randomRevisionSuffix()
+		if err != nil {
+			return "", err
+		}
+		name := fmt.Sprintf("%06d-%s-%s.json", record.Revision, record.CreatedAt.Format("20060102T150405.000000000Z"), suffix)
+		revisionPath := filepath.Join(dir, name)
+		reservation, err := os.OpenFile(revisionPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		if err := reservation.Close(); err != nil {
+			_ = os.Remove(revisionPath)
+			return "", err
+		}
+		if err := atomicWriteFile(revisionPath, data, 0o600); err != nil {
+			_ = os.Remove(revisionPath)
+			return "", err
+		}
+		return revisionPath, nil
+	}
+	return "", errors.New("could not allocate unique revision filename")
+}
+
+func (s siteService) writeRevisionAtPath(record revisionRecord, revisionPath string) error {
 	data, err := json.MarshalIndent(record, "", "  ")
 	if err != nil {
 		return err
 	}
-	dir := s.revisionDir(record.RequestURI)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
+	return atomicWriteFile(revisionPath, data, 0o600)
+}
+
+func randomRevisionSuffix() (string, error) {
+	var buffer [8]byte
+	if _, err := rand.Read(buffer[:]); err != nil {
+		return "", err
 	}
-	name := fmt.Sprintf("%06d-%s.json", record.Revision, record.CreatedAt.Format("20060102T150405Z"))
-	return atomicWriteFile(filepath.Join(dir, name), data, 0o600)
+	return hex.EncodeToString(buffer[:]), nil
 }
 
 func (s siteService) loadRevisions(requestURI string) ([]revisionRecord, error) {
@@ -1182,6 +1452,34 @@ func (s siteService) loadRevisions(requestURI string) ([]revisionRecord, error) 
 	sort.Slice(records, func(i, j int) bool {
 		return records[i].Revision < records[j].Revision
 	})
+	return records, nil
+}
+
+func (s siteService) loadDBRevisionMetadata(request *http.Request, requestURI string) ([]dbRevisionMetadata, error) {
+	if !s.dbPostRevisionConfigured() {
+		return nil, nil
+	}
+	domain, trusted := trustedDBRevisionDomain(request)
+	if !trusted {
+		log.Printf("SiteBrush DB revision metadata using default domain for untrusted host %q", request.Host)
+	}
+	posts, err := Database.LoadPostRevisionsFromConfig(s.config, requestURI, domain)
+	if err != nil {
+		return nil, err
+	}
+	records := make([]dbRevisionMetadata, 0, len(posts))
+	for _, post := range posts {
+		records = append(records, dbRevisionMetadata{
+			Revision:   post.Revision,
+			RequestURI: post.RequestUri,
+			Domain:     post.Domain,
+			Type:       post.Type,
+			Title:      post.Title,
+			Status:     post.Status,
+			Published:  post.Published,
+			CreatedAt:  time.UnixMilli(post.Date).UTC(),
+		})
+	}
 	return records, nil
 }
 
@@ -1432,7 +1730,11 @@ const revisionsTemplate = `
   <input type="hidden" name="revision" value="{{.Revision}}">
   <button type="submit">Restore</button>
 </form></li>{{end}}</ol>
-{{else}}<p>No revisions.</p>{{end}}`
+{{else}}<p>No revisions.</p>{{end}}
+{{if .Data.DBRecords}}
+<h2>Database-backed revisions</h2>
+<ol>{{range .Data.DBRecords}}<li>DB Revision {{.Revision}} {{.Status}} {{if .Published}}published{{else}}unpublished{{end}} for {{.Domain}}{{.RequestURI}} type {{.Type}} at {{.CreatedAt}}</li>{{end}}</ol>
+{{end}}`
 
 const subpagesTemplate = `
 {{if .Data.Pages}}<ul>{{range .Data.Pages}}<li>{{.}}</li>{{end}}</ul>{{else}}<p>No pages found.</p>{{end}}
