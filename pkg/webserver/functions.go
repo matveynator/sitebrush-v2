@@ -1740,7 +1740,9 @@ func (s siteService) handle(responseWriter http.ResponseWriter, request *http.Re
 		s.recover(responseWriter, request)
 	case "verify", "captcha":
 		s.notImplementedPublic(responseWriter, request, action)
-	case "upload", "grab", "domains", "undelete":
+	case "upload":
+		s.upload(responseWriter, request)
+	case "grab", "domains", "undelete":
 		s.notImplementedMutation(responseWriter, request, action)
 	default:
 		http.Error(responseWriter, "Not Found", http.StatusNotFound)
@@ -1794,6 +1796,7 @@ func (s siteService) handleLegacyStatic(responseWriter http.ResponseWriter, requ
 			http.Error(responseWriter, "Not Found", http.StatusNotFound)
 			return true
 		}
+		responseWriter.Header().Set("X-Content-Type-Options", "nosniff")
 		http.ServeFile(responseWriter, request, fileName)
 		return true
 	default:
@@ -1810,12 +1813,21 @@ func parseAction(rawQuery string) (string, error) {
 		return "", errors.New("invalid query")
 	}
 	for key, value := range values {
+		if key == "upload" {
+			if len(value) > 1 {
+				return "", errors.New("invalid query")
+			}
+			if len(value) == 1 && value[0] != "" && value[0] != "file" && value[0] != "image" {
+				return "", errors.New("invalid query")
+			}
+			return key, nil
+		}
 		if len(value) > 1 || (len(value) == 1 && value[0] != "") {
 			return "", errors.New("invalid query")
 		}
 		switch key {
 		case "login", "edit", "delete", "revisions", "subpages", "properties", "freeze", "unfreeze", "backup", "profile", "logout",
-			"join", "verify", "recover", "upload", "grab", "domains", "undelete", "captcha":
+			"join", "verify", "recover", "grab", "domains", "undelete", "captcha":
 			return key, nil
 		default:
 			return "", errors.New("unknown action")

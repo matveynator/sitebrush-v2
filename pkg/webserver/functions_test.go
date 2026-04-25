@@ -3,10 +3,17 @@
 package webserver
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -369,6 +376,9 @@ func TestHandleRequestServesFMediaFromDomainMediaRootOnly(t *testing.T) {
 	if rec.Result().StatusCode != http.StatusOK || !strings.Contains(string(body), "domain media") {
 		t.Fatalf("status/body = %d/%q, want domain media", rec.Result().StatusCode, string(body))
 	}
+	if got := rec.Result().Header.Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("X-Content-Type-Options = %q, want nosniff", got)
+	}
 	if strings.Contains(string(body), "web root media") {
 		t.Fatalf("/f served WEB_FILE_PATH media instead of domain media root: %q", string(body))
 	}
@@ -402,6 +412,218 @@ func TestHandleRequestRejectsUnsafeHostForDomainMedia(t *testing.T) {
 
 	if rec.Result().StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d", rec.Result().StatusCode, http.StatusBadRequest)
+	}
+}
+
+func TestUploadRequiresAuthAndCSRF(t *testing.T) {
+	root := t.TempDir()
+	cfg := testConfig(t, root)
+	body, contentType := multipartUploadBody(t, "upload", "avatar.png", testPNG(t))
+
+	unauthReq := httptest.NewRequest(http.MethodPost, "/?upload=image", bytes.NewReader(body))
+	unauthReq.Header.Set("Content-Type", contentType)
+	unauthRec := httptest.NewRecorder()
+	handleRequest(cfg, unauthRec, unauthReq)
+	if unauthRec.Result().StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauth upload status = %d, want %d", unauthRec.Result().StatusCode, http.StatusUnauthorized)
+	}
+
+	cfg, cookie, _ := loginTestUser(t)
+	body, contentType = multipartUploadBody(t, "upload", "avatar.png", testPNG(t))
+	noCSRFReq := httptest.NewRequest(http.MethodPost, "/?upload=image", bytes.NewReader(body))
+	noCSRFReq.Header.Set("Content-Type", contentType)
+	noCSRFReq.AddCookie(cookie)
+	noCSRFRec := httptest.NewRecorder()
+	handleRequest(cfg, noCSRFRec, noCSRFReq)
+	if noCSRFRec.Result().StatusCode != http.StatusForbidden {
+		t.Fatalf("no-CSRF upload status = %d, want %d", noCSRFRec.Result().StatusCode, http.StatusForbidden)
+	}
+}
+
+func TestImageUploadStoresAndServesFromF(t *testing.T) {
+	cfg, cookie, csrf := loginTestUser(t)
+	body, contentType := multipartUploadBody(t, "upload", "avatar.png", testPNG(t))
+	req := httptest.NewRequest(http.MethodPost, "/?upload=image", bytes.NewReader(body))
+	req.Host = "media.example.test"
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("X-CSRF-Token", csrf)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+
+	handleRequest(cfg, rec, req)
+
+	var response uploadResponse
+	decodeUploadResponse(t, rec, &response)
+	if rec.Result().StatusCode != http.StatusOK || response.Uploaded != 1 {
+		t.Fatalf("upload status/response = %d/%+v, want success", rec.Result().StatusCode, response)
+	}
+	if !strings.HasPrefix(response.URL, "/f/") || !strings.HasSuffix(response.URL, ".png") {
+		t.Fatalf("upload url = %q, want /f/<hash>.png", response.URL)
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, response.URL, nil)
+	getReq.Host = "media.example.test"
+	getRec := httptest.NewRecorder()
+	handleRequest(cfg, getRec, getReq)
+	if getRec.Result().StatusCode != http.StatusOK {
+		t.Fatalf("served uploaded image status = %d, want %d", getRec.Result().StatusCode, http.StatusOK)
+	}
+	served, err := io.ReadAll(getRec.Result().Body)
+	if err != nil {
+		t.Fatalf("read served upload: %v", err)
+	}
+	if !bytes.Equal(served, testPNG(t)) {
+		t.Fatalf("served upload bytes differ from uploaded image")
+	}
+}
+
+func TestFileUploadAllowlistAndRejections(t *testing.T) {
+	cfg, cookie, csrf := loginTestUser(t)
+
+	tests := []struct {
+		name       string
+		uploadURL  string
+		fileName   string
+		content    []byte
+		wantStatus int
+	}{
+		{name: "txt allowed", uploadURL: "/?upload=file", fileName: "notes.txt", content: []byte("plain text notes\n"), wantStatus: http.StatusOK},
+		{name: "html rejected as file", uploadURL: "/?upload=file", fileName: "page.html", content: []byte("<h1>active content</h1>"), wantStatus: http.StatusBadRequest},
+		{name: "htm rejected as file", uploadURL: "/?upload=file", fileName: "page.htm", content: []byte("<h1>active content</h1>"), wantStatus: http.StatusBadRequest},
+		{name: "js rejected as file", uploadURL: "/?upload=file", fileName: "script.js", content: []byte("alert('active content')\n"), wantStatus: http.StatusBadRequest},
+		{name: "css rejected as file", uploadURL: "/?upload=file", fileName: "style.css", content: []byte("body { color: red; }\n"), wantStatus: http.StatusBadRequest},
+		{name: "renamed text as js rejected", uploadURL: "/?upload=file", fileName: "notes.js", content: []byte("plain text notes\n"), wantStatus: http.StatusBadRequest},
+		{name: "svg rejected as image", uploadURL: "/?upload=image", fileName: "vector.svg", content: []byte(`<svg xmlns="http://www.w3.org/2000/svg"></svg>`), wantStatus: http.StatusBadRequest},
+		{name: "exe rejected as file", uploadURL: "/?upload=file", fileName: "tool.exe", content: []byte("MZ executable"), wantStatus: http.StatusBadRequest},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body, contentType := multipartUploadBody(t, "file", tt.fileName, tt.content)
+			req := httptest.NewRequest(http.MethodPost, tt.uploadURL, bytes.NewReader(body))
+			req.Header.Set("Content-Type", contentType)
+			req.Header.Set("X-CSRF-Token", csrf)
+			req.AddCookie(cookie)
+			rec := httptest.NewRecorder()
+
+			handleRequest(cfg, rec, req)
+
+			if rec.Result().StatusCode != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", rec.Result().StatusCode, tt.wantStatus)
+			}
+		})
+	}
+}
+
+func TestUploadIgnoresTraversalFileName(t *testing.T) {
+	cfg, cookie, csrf := loginTestUser(t)
+	body, contentType := multipartUploadBody(t, "upload", "../../evil.png", testPNG(t))
+	req := httptest.NewRequest(http.MethodPost, "/?upload=image", bytes.NewReader(body))
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("X-CSRF-Token", csrf)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+
+	handleRequest(cfg, rec, req)
+
+	var response uploadResponse
+	decodeUploadResponse(t, rec, &response)
+	if rec.Result().StatusCode != http.StatusOK {
+		t.Fatalf("upload status = %d, response %+v; want success", rec.Result().StatusCode, response)
+	}
+	if response.FileName != "evil.png" {
+		t.Fatalf("fileName = %q, want sanitized basename evil.png", response.FileName)
+	}
+	if strings.Contains(response.URL, "evil") || strings.Contains(response.URL, "..") {
+		t.Fatalf("url = %q reflects unsafe original filename", response.URL)
+	}
+}
+
+func TestUploadPersistsMediaRowWhenDBConfigured(t *testing.T) {
+	cfg, cookie, csrf := loginTestUser(t)
+	cfg.DB_TYPE = "sqlite"
+	cfg.DB_FULL_FILE_PATH = filepath.Join(t.TempDir(), "sitebrush.db")
+	body, contentType := multipartUploadBody(t, "upload", "avatar.png", testPNG(t))
+	req := httptest.NewRequest(http.MethodPost, "/?upload=image", bytes.NewReader(body))
+	req.Host = "media.example.test"
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("X-CSRF-Token", csrf)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+
+	handleRequest(cfg, rec, req)
+
+	var response uploadResponse
+	decodeUploadResponse(t, rec, &response)
+	if rec.Result().StatusCode != http.StatusOK {
+		t.Fatalf("upload status = %d, response %+v; want success", rec.Result().StatusCode, response)
+	}
+
+	db, err := sql.Open("sqlite", cfg.DB_FULL_FILE_PATH)
+	if err != nil {
+		t.Fatalf("open upload db: %v", err)
+	}
+	defer db.Close()
+
+	var rowCount int
+	var storagePath, mimeType string
+	var bytesUsed int64
+	if err := db.QueryRow("SELECT COUNT(*), COALESCE(MAX(StoragePath), ''), COALESCE(MAX(MimeType), ''), COALESCE(MAX(BytesUsed), 0) FROM Media").Scan(&rowCount, &storagePath, &mimeType, &bytesUsed); err != nil {
+		t.Fatalf("query media rows: %v", err)
+	}
+	if rowCount != 1 || storagePath != response.URL || mimeType != "image/png" || bytesUsed != response.Size {
+		t.Fatalf("media row count/path/mime/bytes = %d/%q/%q/%d, want 1/%q/image/png/%d", rowCount, storagePath, mimeType, bytesUsed, response.URL, response.Size)
+	}
+}
+
+func TestUploadCleansMediaFileAndSidecarWhenDBPersistenceFails(t *testing.T) {
+	cfg, cookie, csrf := loginTestUser(t)
+	cfg.DB_TYPE = "sqlite"
+	cfg.DB_FULL_FILE_PATH = filepath.Join(t.TempDir(), "missing", "sitebrush.db")
+	content := testPNG(t)
+	body, contentType := multipartUploadBody(t, "upload", "avatar.png", content)
+	req := httptest.NewRequest(http.MethodPost, "/?upload=image", bytes.NewReader(body))
+	req.Host = "media.example.test"
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("X-CSRF-Token", csrf)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+
+	handleRequest(cfg, rec, req)
+
+	var response uploadResponse
+	decodeUploadResponse(t, rec, &response)
+	if rec.Result().StatusCode != http.StatusInternalServerError {
+		t.Fatalf("upload status = %d, response %+v; want DB failure", rec.Result().StatusCode, response)
+	}
+
+	sum := sha256.Sum256(content)
+	storedName := hex.EncodeToString(sum[:]) + ".png"
+	service := siteService{config: cfg, sessions: defaultSessions}
+	roots, err := service.domainPaths("media.example.test")
+	if err != nil {
+		t.Fatalf("domainPaths() unexpected error: %v", err)
+	}
+	mediaPath, err := safeJoinUnderRoot(roots.MediaRoot, storedName)
+	if err != nil {
+		t.Fatalf("media path: %v", err)
+	}
+	if _, err := os.Stat(mediaPath); !os.IsNotExist(err) {
+		t.Fatalf("media file stat error = %v, want not exist after DB failure", err)
+	}
+	sidecarPath, err := service.mediaSidecarPath(roots, storedName)
+	if err != nil {
+		t.Fatalf("sidecar path: %v", err)
+	}
+	if _, err := os.Stat(sidecarPath); !os.IsNotExist(err) {
+		t.Fatalf("sidecar stat error = %v, want not exist after DB failure", err)
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, "/f/"+storedName, nil)
+	getReq.Host = "media.example.test"
+	getRec := httptest.NewRecorder()
+	handleRequest(cfg, getRec, getReq)
+	if getRec.Result().StatusCode != http.StatusNotFound {
+		t.Fatalf("served failed upload status = %d, want %d", getRec.Result().StatusCode, http.StatusNotFound)
 	}
 }
 
@@ -1767,4 +1989,39 @@ func loginPersistentTestUser(t *testing.T, password string) (Config.Settings, *h
 		t.Fatalf("persistent login cookie did not create a valid session")
 	}
 	return cfg, cookie, session.CSRFToken, session
+}
+
+func multipartUploadBody(t *testing.T, fieldName, fileName string, content []byte) ([]byte, string) {
+	t.Helper()
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile(fieldName, fileName)
+	if err != nil {
+		t.Fatalf("create multipart file: %v", err)
+	}
+	if _, err := part.Write(content); err != nil {
+		t.Fatalf("write multipart file: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+	return body.Bytes(), writer.FormDataContentType()
+}
+
+func testPNG(t *testing.T) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, 1, 1))
+	img.Set(0, 0, color.RGBA{R: 255, A: 255})
+	var body bytes.Buffer
+	if err := png.Encode(&body, img); err != nil {
+		t.Fatalf("encode png: %v", err)
+	}
+	return body.Bytes()
+}
+
+func decodeUploadResponse(t *testing.T, rec *httptest.ResponseRecorder, response *uploadResponse) {
+	t.Helper()
+	if err := json.NewDecoder(rec.Result().Body).Decode(response); err != nil {
+		t.Fatalf("decode upload response: %v", err)
+	}
 }
