@@ -149,8 +149,8 @@ func createTables(db *sql.DB, config Config.Settings) (err error) {
 	}
 
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS SiteState (
-    Key TEXT PRIMARY KEY,
-    Value TEXT,
+    StateKey TEXT PRIMARY KEY,
+    StateValue TEXT,
     UpdatedAt INTEGER
   )`)
 
