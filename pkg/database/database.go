@@ -1,23 +1,24 @@
 package database
 
 import (
-	"log"
 	"fmt"
-	"time"
+	"log"
 	"strings"
+	"time"
 
 	"database/sql"
 
-	"sitebrush/pkg/mylog"
-	"sitebrush/pkg/data"
 	"sitebrush/pkg/config"
+	"sitebrush/pkg/data"
+	"sitebrush/pkg/mylog"
 )
 
 // Saving post data to database
 var DatabaseSavePostTask chan Data.Post
 
 var respawnLock chan int
-//по умолчанию оставляем только один процесс который будет брать задачи и записывать их в базу данных
+
+// по умолчанию оставляем только один процесс который будет брать задачи и записывать их в базу данных
 var databaseWorkersMaxCount int = 1
 
 func Run(config Config.Settings) {
@@ -31,7 +32,7 @@ func Run(config Config.Settings) {
 	go func() {
 		for {
 			// will block if there is databaseWorkersMaxCount in respawnLock
-			respawnLock <- 1 
+			respawnLock <- 1
 			//sleep 1 second
 			time.Sleep(1 * time.Second)
 			go databaseWorkerRun(len(respawnLock), config)
@@ -39,24 +40,22 @@ func Run(config Config.Settings) {
 	}()
 }
 
-//close dbConnection on programm exit
+// close dbConnection on programm exit
 func deferCleanup(db *sql.DB) {
 	<-respawnLock
-	err := db.Close() 
+	err := db.Close()
 	if err != nil {
 		log.Println("Error closing database connection:", err)
 	}
 }
 
-func databaseWorkerRun(workerId int, config Config.Settings ) {
-
-
+func databaseWorkerRun(workerId int, config Config.Settings) {
 	dbConnection, err := connectToDb(config)
 
 	defer deferCleanup(dbConnection)
 
-	if err != nil  {
-		MyLog.Printonce(fmt.Sprintf("Database %s is unreachable. Error: %s",  config.DB_TYPE, err))
+	if err != nil {
+		MyLog.Printonce(fmt.Sprintf("Database %s is unreachable. Error: %s", config.DB_TYPE, err))
 		return
 
 	} else {
@@ -70,7 +69,10 @@ func databaseWorkerRun(workerId int, config Config.Settings ) {
 		for {
 			//do watchdog operations only if channel with database tasks is empty (channel length equals zero):
 			if len(DatabaseSavePostTask) == 0 {
-				_, err = dbConnection.Exec("UPDATE DBWatchDog SET UnixTime = ? WHERE ID = 1", time.Now().UnixMilli())
+				_, err = dbConnection.Exec(
+					fmt.Sprintf("UPDATE DBWatchDog SET UnixTime = %s WHERE ID = 1", sqlPlaceholder(config.DB_TYPE, 1)),
+					time.Now().UnixMilli(),
+				)
 				if err != nil {
 					//skip busy SQLITE database errors:
 					if !strings.Contains(err.Error(), "database is locked (5) (SQLITE_BUSY)") {
@@ -94,32 +96,23 @@ func databaseWorkerRun(workerId int, config Config.Settings ) {
 	for {
 		select {
 
-      //в случае если есть задание в канале DatabaseSavePostTask
-    case <- DatabaseSavePostTask :
-      //sleep some time to calm down disk operations:
-      time.Sleep(config.DB_SAVE_INTERVAL_DURATION)
-      //пробежать во всем доступным данным в канале заданий для бд и сохранить их в базе данных:
-      for currentDatabaseSavePostTask := range DatabaseSavePostTask {
-        err := SavePostDataInDB(dbConnection, currentDatabaseSavePostTask)
-        if err != nil {
-          //skip busy SQLITE database errors:
-          if strings.Contains(err.Error(), "database is locked (5) (SQLITE_BUSY)") {
-            log.Println("Saving data to disk notice: Database is busy - sleeping to calm down operations.")
-            //return task to channel (this may lead to post data id misorder in database):
-            DatabaseSavePostTask <- currentDatabaseSavePostTask
-            //sleep some time to calm down disk operations:
-            time.Sleep(config.DB_SAVE_INTERVAL_DURATION)
-          }  else {
-            //return task to channel (this may lead to post data id misorder in database):
-            DatabaseSavePostTask <- currentDatabaseSavePostTask
+		//в случае если есть задание в канале DatabaseSavePostTask
+		case currentDatabaseSavePostTask := <-DatabaseSavePostTask:
+			//sleep some time to calm down disk operations:
+			time.Sleep(config.DB_SAVE_INTERVAL_DURATION)
+			//сохранить полученное задание в базе данных:
+			err := processDatabaseSavePostTask(
+				currentDatabaseSavePostTask,
+				DatabaseSavePostTask,
+				func(post Data.Post) error { return SavePostDataInDB(dbConnection, post, config.DB_TYPE) },
+				func() { time.Sleep(config.DB_SAVE_INTERVAL_DURATION) },
+			)
+			if err != nil {
+				log.Printf("Database worker %d exited due to critical processing error: %s\n", workerId, err)
+				return
+			}
 
-            log.Printf("Database worker %d exited due to critical processing error: %s\n", workerId, err)
-            return
-          }
-        }
-      }
-
-		case databaseError := <-databaseErrorChannel :
+		case databaseError := <-databaseErrorChannel:
 			//обнаружена критическая ошибка базы данных - завершаем гоурутину:
 			log.Printf("Database worker %d exited due to critical error: %s\n", workerId, databaseError)
 			return
@@ -130,3 +123,31 @@ func databaseWorkerRun(workerId int, config Config.Settings ) {
 	}
 }
 
+func processDatabaseSavePostTask(currentDatabaseSavePostTask Data.Post, taskQueue chan<- Data.Post, save func(Data.Post) error, sleep func()) error {
+	err := save(currentDatabaseSavePostTask)
+	if err == nil {
+		return nil
+	}
+
+	//skip busy SQLITE database errors:
+	if strings.Contains(err.Error(), "database is locked (5) (SQLITE_BUSY)") {
+		log.Println("Saving data to disk notice: Database is busy - sleeping to calm down operations.")
+		requeueDatabaseSavePostTask(taskQueue, currentDatabaseSavePostTask)
+		//sleep some time to calm down disk operations:
+		sleep()
+		return nil
+	}
+
+	requeueDatabaseSavePostTask(taskQueue, currentDatabaseSavePostTask)
+	return err
+}
+
+func requeueDatabaseSavePostTask(taskQueue chan<- Data.Post, task Data.Post) {
+	select {
+	case taskQueue <- task:
+	default:
+		go func() {
+			taskQueue <- task
+		}()
+	}
+}

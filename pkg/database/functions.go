@@ -1,16 +1,58 @@
 package database
 
 import (
+	"crypto/rand"
 	"database/sql"
 	"errors"
 	"fmt"
 	"log"
+	"math/big"
 	"strings"
+	"sync"
 	"time"
 
 	"sitebrush/pkg/config"
 	"sitebrush/pkg/data"
 )
+
+var postRevisionAllocationLocks = newPostRevisionKeyedMutex()
+
+type postRevisionKeyedMutex struct {
+	mu    sync.Mutex
+	locks map[string]*postRevisionKeyedLock
+}
+
+type postRevisionKeyedLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func newPostRevisionKeyedMutex() *postRevisionKeyedMutex {
+	return &postRevisionKeyedMutex{locks: map[string]*postRevisionKeyedLock{}}
+}
+
+func (k *postRevisionKeyedMutex) lock(key string) func() {
+	k.mu.Lock()
+	lock := k.locks[key]
+	if lock == nil {
+		lock = &postRevisionKeyedLock{}
+		k.locks[key] = lock
+	}
+	lock.refs++
+	k.mu.Unlock()
+
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+
+		k.mu.Lock()
+		lock.refs--
+		if lock.refs == 0 {
+			delete(k.locks, key)
+		}
+		k.mu.Unlock()
+	}
+}
 
 func connectToDb(config Config.Settings) (db *sql.DB, err error) {
 	if config.DB_TYPE == "genji" {
@@ -102,11 +144,13 @@ func connectToDb(config Config.Settings) (db *sql.DB, err error) {
 }
 
 func createTables(db *sql.DB, config Config.Settings) (err error) {
+	int64Type := int64ColumnType(config.DB_TYPE)
+	primaryKeyType := primaryKeyColumnType(config.DB_TYPE)
 
-	_, err = db.Exec(`CREATE TABLE if not exists DBWatchDog(
-    Id INT PRIMARY KEY, 
-    UnixTime INT
-  )`)
+	_, err = db.Exec(fmt.Sprintf(`CREATE TABLE if not exists DBWatchDog(
+    Id %s,
+    UnixTime %s
+  )`, primaryKeyType, int64Type))
 
 	if err != nil {
 		return
@@ -116,7 +160,11 @@ func createTables(db *sql.DB, config Config.Settings) (err error) {
 		// Create a sql/database DB instance
 		err = db.QueryRow("SELECT Id FROM DBWatchDog").Scan(&id)
 		if err != nil {
-			_, err = db.Exec("INSERT INTO DBWatchDog (Id,UnixTime) VALUES (?,?)", 1, time.Now().UnixMilli())
+			_, err = db.Exec(
+				fmt.Sprintf("INSERT INTO DBWatchDog (Id,UnixTime) VALUES (%s)", sqlPlaceholders(config.DB_TYPE, 2)),
+				1,
+				time.Now().UnixMilli(),
+			)
 			if err != nil {
 				return
 			} else {
@@ -125,21 +173,25 @@ func createTables(db *sql.DB, config Config.Settings) (err error) {
 		}
 	}
 
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS Post (
-    Id INTEGER PRIMARY KEY,
+	_, err = db.Exec(fmt.Sprintf(`CREATE TABLE IF NOT EXISTS Post (
+    Id %s,
     OwnerId INTEGER,
     EditorId INTEGER,
+    DeleterId INTEGER,
     RequestUri TEXT,
-    Date INTEGER,
+    Type TEXT,
+    Date %s,
     Title TEXT,
     Body TEXT,
     Header TEXT,
+    Summary TEXT,
+    ShortText TEXT,
     Tags TEXT,
     Revision INTEGER,
     Domain TEXT,
     Status TEXT,
     Published TEXT
-  )`)
+  )`, primaryKeyType, int64Type))
 
 	if err != nil {
 		return
@@ -147,32 +199,196 @@ func createTables(db *sql.DB, config Config.Settings) (err error) {
 	if err = ensurePostColumns(db, config.DB_TYPE); err != nil {
 		return
 	}
+	if err = ensurePostRevisionIndex(db, config.DB_TYPE); err != nil {
+		return
+	}
 
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS SiteState (
+	if err = createFoundationTables(db, config.DB_TYPE); err != nil {
+		return
+	}
+
+	_, err = db.Exec(fmt.Sprintf(`CREATE TABLE IF NOT EXISTS SiteState (
     StateKey TEXT PRIMARY KEY,
     StateValue TEXT,
-    UpdatedAt INTEGER
-  )`)
+    UpdatedAt %s
+  )`, int64Type))
 
 	if err != nil {
 		return
 	}
 
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS Backup (
-    Id INTEGER PRIMARY KEY,
+	_, err = db.Exec(fmt.Sprintf(`CREATE TABLE IF NOT EXISTS Backup (
+    Id %s,
+    Domain TEXT,
     Path TEXT,
     Checksum TEXT,
-    Size INTEGER,
-    CreatedAt INTEGER,
+    Size %s,
+    Format TEXT,
+    DownloadToken TEXT,
+    CreatedAt %s,
+    CompletedAt %s,
     Status TEXT,
     Error TEXT
-  )`)
+  )`, primaryKeyType, int64Type, int64Type, int64Type))
 
 	if err != nil {
+		return
+	}
+	if err = ensureBackupColumns(db, config.DB_TYPE); err != nil {
 		return
 	}
 
 	return
+}
+
+func createFoundationTables(db *sql.DB, dbType string) error {
+	int64Type := int64ColumnType(dbType)
+	boolType := boolColumnType(dbType)
+	primaryKeyType := primaryKeyColumnType(dbType)
+
+	statements := []string{
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS Domain (
+			Id %s,
+			Name TEXT,
+			DNSZoneData TEXT,
+			CNAMESecret TEXT,
+			EmailSecretHash TEXT,
+			Status TEXT,
+			Frozen %s
+		)`, primaryKeyType, boolType),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS UserAccount (
+			Id %s,
+			SessionId TEXT,
+			OldId %s,
+			AvatarId %s,
+			Email TEXT,
+			PasswordHash TEXT,
+			Nickname TEXT,
+			FirstName TEXT,
+			LastName TEXT,
+			Gender TEXT,
+			Phone TEXT,
+			DateOfRegistration %s,
+			DateOfBirth %s,
+			LastVisitTime %s,
+			GreenwichOffset INTEGER,
+			Activated TEXT,
+			VerificationCode TEXT,
+			Domain TEXT,
+			Status TEXT,
+			Language TEXT,
+			CurrentIP TEXT,
+			Profile TEXT,
+			Preferences TEXT,
+			SecurityLog TEXT,
+			InvitedBy TEXT,
+			InvitesAmount INTEGER,
+			QuotaBytes TEXT,
+			QuotaOriginals TEXT,
+			QuotaBytesUsed %s,
+			QuotaOriginalsUsed %s,
+			AutoGrab TEXT,
+			DomainToGrab TEXT
+		)`, primaryKeyType, int64Type, int64Type, int64Type, int64Type, int64Type, int64Type, int64Type),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS GroupRole (
+			Id %s,
+			OwnerId %s,
+			Name TEXT,
+			Title TEXT,
+			Comment TEXT,
+			Date %s,
+			Status TEXT,
+			Domain TEXT
+		)`, primaryKeyType, int64Type, int64Type),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS UserGroupRole (
+			UserId %s,
+			GroupId %s,
+			Status TEXT,
+			Domain TEXT
+		)`, int64Type, int64Type),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS Redirect (
+			Id %s,
+			OldUri TEXT,
+			NewUri TEXT,
+			Date %s,
+			Status TEXT,
+			Domain TEXT
+		)`, primaryKeyType, int64Type),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS Media (
+			Id %s,
+			Type TEXT,
+			Hash TEXT,
+			OriginalHash TEXT,
+			Format TEXT,
+			MimeType TEXT,
+			StoragePath TEXT,
+			Width INTEGER,
+			Height INTEGER,
+			Status TEXT,
+			Domain TEXT,
+			Day INTEGER,
+			Date %s,
+			SizesArray TEXT,
+			Rating REAL,
+			RatingCount INTEGER,
+			RatingIP TEXT,
+			Views INTEGER,
+			BytesUsed %s
+		)`, primaryKeyType, int64Type, int64Type),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS Template (
+			Id %s,
+			Name TEXT,
+			Data TEXT,
+			Status TEXT,
+			Domain TEXT
+		)`, primaryKeyType),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS PostTemplate (
+			PostId %s,
+			TemplateId %s,
+			Status TEXT,
+			Domain TEXT
+		)`, int64Type, int64Type),
+	}
+
+	for _, statement := range statements {
+		if _, err := db.Exec(statement); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func int64ColumnType(dbType string) string {
+	if dbType == "postgres" {
+		return "BIGINT"
+	}
+	return "INTEGER"
+}
+
+func boolColumnType(dbType string) string {
+	if dbType == "postgres" {
+		return "BOOLEAN"
+	}
+	return "INTEGER"
+}
+
+func primaryKeyColumnType(dbType string) string {
+	return int64ColumnType(dbType) + " PRIMARY KEY"
+}
+
+func sqlPlaceholder(dbType string, index int) string {
+	if dbType == "postgres" {
+		return fmt.Sprintf("$%d", index)
+	}
+	return "?"
+}
+
+func sqlPlaceholders(dbType string, count int) string {
+	placeholders := make([]string, count)
+	for i := range placeholders {
+		placeholders[i] = sqlPlaceholder(dbType, i+1)
+	}
+	return strings.Join(placeholders, ", ")
 }
 
 func ensurePostColumns(db *sql.DB, dbType string) error {
@@ -186,11 +402,15 @@ func ensurePostColumns(db *sql.DB, dbType string) error {
 	}{
 		{"OwnerId", "INTEGER"},
 		{"EditorId", "INTEGER"},
+		{"DeleterId", "INTEGER"},
 		{"RequestUri", "TEXT"},
-		{"Date", "INTEGER"},
+		{"Type", "TEXT"},
+		{"Date", int64ColumnType(dbType)},
 		{"Title", "TEXT"},
 		{"Body", "TEXT"},
 		{"Header", "TEXT"},
+		{"Summary", "TEXT"},
+		{"ShortText", "TEXT"},
 		{"Tags", "TEXT"},
 		{"Revision", "INTEGER"},
 		{"Domain", "TEXT"},
@@ -206,6 +426,43 @@ func ensurePostColumns(db *sql.DB, dbType string) error {
 	return nil
 }
 
+func ensurePostRevisionIndex(db *sql.DB, dbType string) error {
+	if dbType == "genji" {
+		return nil
+	}
+	_, err := db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_post_domain_requesturi_revision ON Post (Domain, RequestUri, Revision)")
+	return err
+}
+
+func ensureBackupColumns(db *sql.DB, dbType string) error {
+	if dbType == "genji" {
+		return nil
+	}
+
+	columns := []struct {
+		name       string
+		definition string
+	}{
+		{"Domain", "TEXT"},
+		{"Path", "TEXT"},
+		{"Checksum", "TEXT"},
+		{"Size", int64ColumnType(dbType)},
+		{"Format", "TEXT"},
+		{"DownloadToken", "TEXT"},
+		{"CreatedAt", int64ColumnType(dbType)},
+		{"CompletedAt", int64ColumnType(dbType)},
+		{"Status", "TEXT"},
+		{"Error", "TEXT"},
+	}
+
+	for _, column := range columns {
+		if _, err := db.Exec(fmt.Sprintf("ALTER TABLE Backup ADD COLUMN %s %s", column.name, column.definition)); err != nil && !isDuplicateColumnError(err) {
+			return err
+		}
+	}
+	return nil
+}
+
 func isDuplicateColumnError(err error) bool {
 	message := strings.ToLower(err.Error())
 	return strings.Contains(message, "duplicate column") ||
@@ -213,30 +470,278 @@ func isDuplicateColumnError(err error) bool {
 		strings.Contains(message, "duplicate_column")
 }
 
-// SavePostDataInDB - функция для сохранения данных структуры Post в базу данных.
-func SavePostDataInDB(databaseConnection *sql.DB, post Data.Post) (err error) {
-
-	// Переменная для подсчета количества записей с указанным RequestUri.
-	var count int
-
-	// Пытаемся получить количество записей с таким же RequestUri, как у переданного post.
-	err = databaseConnection.QueryRow("SELECT COUNT(*) FROM Post WHERE RequestUri = ? and Domain = ?", post.RequestUri, post.Domain).Scan(&count)
-
-	// Если произошла ошибка при выполнении запроса, возвращаем ошибку.
+// SavePostRevisionFromConfig opens the configured database, ensures the schema
+// exists, and synchronously stores an immutable Post revision. It returns the
+// saved Post with Id and Revision fields populated.
+func SavePostRevisionFromConfig(config Config.Settings, post Data.Post) (Data.Post, error) {
+	dbConnection, err := connectToDb(config)
 	if err != nil {
-		return err
+		return post, err
 	}
-	//Подготавливаем номер ревизии:
-	post.Revision = count + 1
+	if dbConnection == nil {
+		return post, errors.New("database connection is nil")
+	}
+	defer dbConnection.Close()
+
+	return savePostDataInDB(dbConnection, post, config.DB_TYPE)
+}
+
+// LoadPostRevisionsFromConfig returns DB-backed Post revisions for one
+// request/domain pair. It intentionally filters to the requested page so callers
+// can acknowledge DB-backed revisions without needing a full-site DB listing.
+func LoadPostRevisionsFromConfig(config Config.Settings, requestURI, domain string) ([]Data.Post, error) {
+	dbConnection, err := connectToDb(config)
+	if err != nil {
+		return nil, err
+	}
+	if dbConnection == nil {
+		return nil, errors.New("database connection is nil")
+	}
+	defer dbConnection.Close()
+
+	rows, err := dbConnection.Query(
+		fmt.Sprintf(`SELECT COALESCE(Id, 0), COALESCE(OwnerId, 0), COALESCE(EditorId, 0), COALESCE(DeleterId, 0), COALESCE(RequestUri, ''), COALESCE(Type, ''), COALESCE(Date, 0), COALESCE(Title, ''), COALESCE(Body, ''), COALESCE(Header, ''), COALESCE(Summary, ''), COALESCE(ShortText, ''), COALESCE(Tags, ''), COALESCE(Revision, 0), COALESCE(Domain, ''), COALESCE(Status, ''), COALESCE(Published, false)
+			FROM Post
+			WHERE RequestUri = %s AND Domain = %s
+			ORDER BY Revision`, sqlPlaceholder(config.DB_TYPE, 1), sqlPlaceholder(config.DB_TYPE, 2)),
+		requestURI,
+		domain,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	posts := []Data.Post{}
+	for rows.Next() {
+		var post Data.Post
+		if err := rows.Scan(
+			&post.Id,
+			&post.OwnerId,
+			&post.EditorId,
+			&post.DeleterId,
+			&post.RequestUri,
+			&post.Type,
+			&post.Date,
+			&post.Title,
+			&post.Body,
+			&post.Header,
+			&post.Summary,
+			&post.ShortText,
+			&post.Tags,
+			&post.Revision,
+			&post.Domain,
+			&post.Status,
+			&post.Published,
+		); err != nil {
+			return nil, err
+		}
+		posts = append(posts, post)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return posts, nil
+}
+
+// SaveRedirectFromConfig opens the configured database and upserts one active
+// redirect for an old URI/domain pair.
+func SaveRedirectFromConfig(config Config.Settings, redirect Data.Redirect) (Data.Redirect, error) {
+	dbConnection, err := connectToDb(config)
+	if err != nil {
+		return redirect, err
+	}
+	if dbConnection == nil {
+		return redirect, errors.New("database connection is nil")
+	}
+	defer dbConnection.Close()
+
+	return saveRedirectInDB(dbConnection, redirect, config.DB_TYPE)
+}
+
+// LoadRedirectFromConfig returns the newest active redirect for an old
+// URI/domain pair.
+func LoadRedirectFromConfig(config Config.Settings, oldURI, domain string) (Data.Redirect, bool, error) {
+	dbConnection, err := connectToDb(config)
+	if err != nil {
+		return Data.Redirect{}, false, err
+	}
+	if dbConnection == nil {
+		return Data.Redirect{}, false, errors.New("database connection is nil")
+	}
+	defer dbConnection.Close()
+
+	row := dbConnection.QueryRow(
+		fmt.Sprintf(`SELECT COALESCE(Id, 0), COALESCE(OldUri, ''), COALESCE(NewUri, ''), COALESCE(Date, 0), COALESCE(Status, ''), COALESCE(Domain, '')
+			FROM Redirect
+			WHERE OldUri = %s AND Domain = %s AND Status = 'active'
+			ORDER BY Date DESC`, sqlPlaceholder(config.DB_TYPE, 1), sqlPlaceholder(config.DB_TYPE, 2)),
+		oldURI,
+		domain,
+	)
+	var redirect Data.Redirect
+	if err := row.Scan(&redirect.Id, &redirect.OldUri, &redirect.NewUri, &redirect.Date, &redirect.Status, &redirect.Domain); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Data.Redirect{}, false, nil
+		}
+		return Data.Redirect{}, false, err
+	}
+	return redirect, true, nil
+}
+
+// SavePostDataInDB - функция для сохранения данных структуры Post в базу данных.
+func SavePostDataInDB(databaseConnection *sql.DB, post Data.Post, dbTypes ...string) (err error) {
+	dbType := "sqlite"
+	if len(dbTypes) > 0 {
+		dbType = dbTypes[0]
+	}
+
+	_, err = savePostDataInDB(databaseConnection, post, dbType)
+	return err
+}
+
+func saveRedirectInDB(databaseConnection *sql.DB, redirect Data.Redirect, dbType string) (Data.Redirect, error) {
+	if databaseConnection == nil {
+		return redirect, errors.New("database connection is nil")
+	}
+	if redirect.Status == "" {
+		redirect.Status = "active"
+	}
+	if redirect.Date == 0 {
+		redirect.Date = time.Now().UnixMilli()
+	}
+
+	tx, err := databaseConnection.Begin()
+	if err != nil {
+		return redirect, err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(
+		fmt.Sprintf("DELETE FROM Redirect WHERE OldUri = %s AND Domain = %s", sqlPlaceholder(dbType, 1), sqlPlaceholder(dbType, 2)),
+		redirect.OldUri,
+		redirect.Domain,
+	); err != nil {
+		return redirect, err
+	}
+
+	insertID := any(redirect.Id)
+	if redirect.Id == 0 {
+		if dbType == "sqlite" {
+			insertID = nil
+		} else {
+			redirect.Id, err = randomPostID()
+			if err != nil {
+				return redirect, err
+			}
+			insertID = redirect.Id
+		}
+	}
+
+	result, err := tx.Exec(
+		fmt.Sprintf("INSERT INTO Redirect (Id, OldUri, NewUri, Date, Status, Domain) VALUES (%s)", sqlPlaceholders(dbType, 6)),
+		insertID,
+		redirect.OldUri,
+		redirect.NewUri,
+		redirect.Date,
+		redirect.Status,
+		redirect.Domain,
+	)
+	if err != nil {
+		return redirect, err
+	}
+	if redirect.Id == 0 && dbType == "sqlite" {
+		redirect.Id, err = result.LastInsertId()
+		if err != nil {
+			return redirect, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return redirect, err
+	}
+	return redirect, nil
+}
+
+func savePostDataInDB(databaseConnection *sql.DB, post Data.Post, dbType string) (Data.Post, error) {
+	if databaseConnection == nil {
+		return post, errors.New("database connection is nil")
+	}
+
+	unlock := postRevisionAllocationLocks.lock(post.Domain + "\x00" + post.RequestUri)
+	defer unlock()
+
+	tx, err := databaseConnection.Begin()
+	if err != nil {
+		return post, err
+	}
+	defer tx.Rollback()
+
+	if err := tx.QueryRow(
+		fmt.Sprintf("SELECT COALESCE(MAX(Revision), 0) + 1 FROM Post WHERE RequestUri = %s and Domain = %s", sqlPlaceholder(dbType, 1), sqlPlaceholder(dbType, 2)),
+		post.RequestUri,
+		post.Domain,
+	).Scan(&post.Revision); err != nil {
+		return post, err
+	}
+
+	insertID := any(post.Id)
+	if post.Id == 0 {
+		if dbType == "sqlite" {
+			insertID = nil
+		} else {
+			post.Id, err = randomPostID()
+			if err != nil {
+				return post, err
+			}
+			insertID = post.Id
+		}
+	}
 
 	// Добавляем новую запись в таблицу Post с данными из структуры post.
-	_, err = databaseConnection.Exec("INSERT INTO Post (Id, OwnerId, EditorId, RequestUri, Date, Title, Body, Header, Tags, Revision, Domain, Status, Published) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", post.Id, post.OwnerId, post.EditorId, post.RequestUri, post.Date, post.Title, post.Body, post.Header, post.Tags, post.Revision, post.Domain, post.Status, post.Published)
+	result, err := tx.Exec(
+		fmt.Sprintf("INSERT INTO Post (Id, OwnerId, EditorId, DeleterId, RequestUri, Type, Date, Title, Body, Header, Summary, ShortText, Tags, Revision, Domain, Status, Published) VALUES (%s)", sqlPlaceholders(dbType, 17)),
+		insertID,
+		post.OwnerId,
+		post.EditorId,
+		post.DeleterId,
+		post.RequestUri,
+		post.Type,
+		post.Date,
+		post.Title,
+		post.Body,
+		post.Header,
+		post.Summary,
+		post.ShortText,
+		post.Tags,
+		post.Revision,
+		post.Domain,
+		post.Status,
+		post.Published,
+	)
 
 	// Если при добавлении записи произошла ошибка, возвращаем эту ошибку.
 	if err != nil {
-		return err
+		return post, err
+	}
+	if post.Id == 0 && dbType == "sqlite" {
+		post.Id, err = result.LastInsertId()
+		if err != nil {
+			return post, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return post, err
 	}
 
 	// Если функция успешно выполнена, возвращаем nil (нет ошибки).
-	return nil
+	return post, nil
+}
+
+func randomPostID() (int64, error) {
+	max := new(big.Int).Lsh(big.NewInt(1), 62)
+	value, err := rand.Int(rand.Reader, max)
+	if err != nil {
+		return 0, err
+	}
+	return value.Int64() + 1, nil
 }
