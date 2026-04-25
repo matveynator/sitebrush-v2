@@ -4,6 +4,7 @@ package database
 
 import (
 	"database/sql"
+	"path/filepath"
 	"testing"
 
 	Config "sitebrush/pkg/config"
@@ -141,6 +142,20 @@ func TestEnsurePostColumnsSkipsGenji(t *testing.T) {
 
 	if err := ensurePostColumns(db, "genji"); err != nil {
 		t.Fatalf("ensurePostColumns() with genji db type returned error: %v", err)
+	}
+}
+
+func TestCreateTablesSupportsGenjiSchema(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "sitebrush-genji.db")
+	db, err := sql.Open("genji", dbPath)
+	if err != nil {
+		t.Fatalf("open genji db: %v", err)
+	}
+	defer db.Close()
+
+	cfg := Config.Settings{DB_TYPE: "genji", DB_FULL_FILE_PATH: dbPath}
+	if err := createTables(db, cfg); err != nil {
+		t.Fatalf("create tables with genji schema: %v", err)
 	}
 }
 
