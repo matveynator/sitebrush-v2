@@ -109,6 +109,96 @@ func TestSafeRequestedFilePathRejectsExistingSymlinkEscape(t *testing.T) {
 	}
 }
 
+func TestCanonicalHostNormalizesValidHosts(t *testing.T) {
+	tests := []struct {
+		name string
+		host string
+		want string
+	}{
+		{name: "domain lowercase", host: "Example.COM", want: "example.com"},
+		{name: "domain strips port", host: "Example.COM:2444", want: "example.com"},
+		{name: "domain strips trailing dot", host: "Example.COM.", want: "example.com"},
+		{name: "localhost with port", host: "localhost:2444", want: "localhost"},
+		{name: "ipv4 with port", host: "127.0.0.1:8080", want: "127.0.0.1"},
+		{name: "bracketed ipv6 with port", host: "[::1]:2444", want: "::1"},
+		{name: "bracketed ipv6 without port", host: "[::1]", want: "::1"},
+		{name: "ipv6 without port", host: "2001:db8::1", want: "2001:db8::1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := canonicalHost(tt.host)
+			if err != nil {
+				t.Fatalf("canonicalHost(%q) unexpected error: %v", tt.host, err)
+			}
+			if got != tt.want {
+				t.Fatalf("canonicalHost(%q) = %q, want %q", tt.host, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCanonicalHostRejectsUnsafeHosts(t *testing.T) {
+	longLabel := strings.Repeat("a", 64) + ".example"
+	longHost := strings.Repeat("a", 254)
+	badHosts := []string{
+		"",
+		" example.com",
+		"example.com ",
+		"example.com/path",
+		`example.com\path`,
+		"bad host.example",
+		"bad_host.example",
+		"example..com",
+		"-bad.example",
+		"bad-.example",
+		"exa$mple.com",
+		"example.com:abc",
+		"[example.com]",
+		"[bad-host.example]",
+		"[example.com]:2444",
+		"example.com\n",
+		longLabel,
+		longHost,
+	}
+
+	for _, host := range badHosts {
+		t.Run(host, func(t *testing.T) {
+			if got, err := canonicalHost(host); err == nil {
+				t.Fatalf("canonicalHost(%q) = %q, nil error; want rejection", host, got)
+			}
+		})
+	}
+}
+
+func TestDomainPathsStayInsideConfiguredRoots(t *testing.T) {
+	root := t.TempDir()
+	cfg := testConfig(t, root)
+	service := siteService{config: cfg, sessions: defaultSessions}
+
+	roots, err := service.domainPaths("Example.COM:2444")
+	if err != nil {
+		t.Fatalf("domainPaths() unexpected error: %v", err)
+	}
+
+	if !pathIsInsideRoot(root, roots.PublicRoot) {
+		t.Fatalf("public root %q is outside web root %q", roots.PublicRoot, root)
+	}
+	archiveRoot := service.archiveRoot()
+	for name, path := range map[string]string{
+		"archive": roots.ArchiveRoot,
+		"cache":   roots.CacheRoot,
+		"media":   roots.MediaRoot,
+	} {
+		if !pathIsInsideRoot(archiveRoot, path) {
+			t.Fatalf("%s root %q is outside archive root %q", name, path, archiveRoot)
+		}
+		if !strings.Contains(path, "example.com") {
+			t.Fatalf("%s root %q does not include canonical host", name, path)
+		}
+	}
+}
+
 func TestHandleRequestServesStaticFilesWithHTTPTest(t *testing.T) {
 	root := t.TempDir()
 	writeFixtureFile(t, root, "index.html", "home page")
@@ -152,6 +242,168 @@ func TestHandleRequestServesStaticFilesWithHTTPTest(t *testing.T) {
 			}
 			if tt.wantBody == "" && len(body) != 0 {
 				t.Fatalf("body = %q, want empty body", string(body))
+			}
+		})
+	}
+}
+
+func TestHandleRequestServesLegacyPAndDStaticAliasesSafely(t *testing.T) {
+	root := t.TempDir()
+	writeFixtureFile(t, root, "p/editor/app.js", "p asset")
+	writeFixtureFile(t, root, "d/theme/site.css", "d asset")
+	cfg := testConfig(t, root)
+
+	tests := []struct {
+		name       string
+		path       string
+		wantStatus int
+		wantBody   string
+	}{
+		{name: "p asset", path: "/p/editor/app.js", wantStatus: http.StatusOK, wantBody: "p asset"},
+		{name: "d asset", path: "/d/theme/site.css", wantStatus: http.StatusOK, wantBody: "d asset"},
+		{name: "missing p asset", path: "/p/missing.js", wantStatus: http.StatusNotFound, wantBody: "Not Found"},
+		{name: "p traversal forbidden", path: "/p/%2e%2e/index.html", wantStatus: http.StatusForbidden, wantBody: "Forbidden"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tt.path, nil)
+			rec := httptest.NewRecorder()
+
+			handleRequest(cfg, rec, req)
+
+			if rec.Result().StatusCode != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", rec.Result().StatusCode, tt.wantStatus)
+			}
+			body, err := io.ReadAll(rec.Result().Body)
+			if err != nil {
+				t.Fatalf("read response body: %v", err)
+			}
+			if !strings.Contains(string(body), tt.wantBody) {
+				t.Fatalf("body = %q, want substring %q", string(body), tt.wantBody)
+			}
+		})
+	}
+}
+
+func TestHandleRequestServesFMediaFromDomainMediaRootOnly(t *testing.T) {
+	root := t.TempDir()
+	cfg := testConfig(t, root)
+	service := siteService{config: cfg, sessions: defaultSessions}
+	roots, err := service.domainPaths("media.example.test")
+	if err != nil {
+		t.Fatalf("domainPaths() unexpected error: %v", err)
+	}
+	writeFixtureFile(t, roots.MediaRoot, "avatar.png", "domain media")
+	writeFixtureFile(t, root, "f/avatar.png", "web root media must not be served")
+
+	req := httptest.NewRequest(http.MethodGet, "/f/avatar.png", nil)
+	req.Host = "Media.Example.Test:8080"
+	rec := httptest.NewRecorder()
+	handleRequest(cfg, rec, req)
+
+	body, err := io.ReadAll(rec.Result().Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if rec.Result().StatusCode != http.StatusOK || !strings.Contains(string(body), "domain media") {
+		t.Fatalf("status/body = %d/%q, want domain media", rec.Result().StatusCode, string(body))
+	}
+	if strings.Contains(string(body), "web root media") {
+		t.Fatalf("/f served WEB_FILE_PATH media instead of domain media root: %q", string(body))
+	}
+
+	missingHostReq := httptest.NewRequest(http.MethodGet, "/f/avatar.png", nil)
+	missingHostReq.Host = "other.example.test"
+	missingHostRec := httptest.NewRecorder()
+	handleRequest(cfg, missingHostRec, missingHostReq)
+	if missingHostRec.Result().StatusCode != http.StatusNotFound {
+		t.Fatalf("missing host media status = %d, want %d", missingHostRec.Result().StatusCode, http.StatusNotFound)
+	}
+
+	traversalReq := httptest.NewRequest(http.MethodGet, "/f/%2e%2e/avatar.png", nil)
+	traversalReq.Host = "media.example.test"
+	traversalRec := httptest.NewRecorder()
+	handleRequest(cfg, traversalRec, traversalReq)
+	if traversalRec.Result().StatusCode != http.StatusForbidden {
+		t.Fatalf("traversal status = %d, want %d", traversalRec.Result().StatusCode, http.StatusForbidden)
+	}
+}
+
+func TestHandleRequestRejectsUnsafeHostForDomainMedia(t *testing.T) {
+	root := t.TempDir()
+	cfg := testConfig(t, root)
+
+	req := httptest.NewRequest(http.MethodGet, "/f/avatar.png", nil)
+	req.Host = "bad_host.example"
+	rec := httptest.NewRecorder()
+
+	handleRequest(cfg, rec, req)
+
+	if rec.Result().StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", rec.Result().StatusCode, http.StatusBadRequest)
+	}
+}
+
+func TestHandleRequestDoesNotPubliclyServeBackups(t *testing.T) {
+	root := t.TempDir()
+	writeFixtureFile(t, root, "b/site.zip", "backup data")
+	cfg := testConfig(t, root)
+
+	req := httptest.NewRequest(http.MethodGet, "/b/site.zip", nil)
+	rec := httptest.NewRecorder()
+
+	handleRequest(cfg, rec, req)
+
+	if rec.Result().StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", rec.Result().StatusCode, http.StatusNotFound)
+	}
+}
+
+func TestParseActionRecognizesPlannedV1ParityActions(t *testing.T) {
+	actions := []string{"join", "verify", "recover", "upload", "grab", "domains", "undelete", "captcha"}
+	for _, action := range actions {
+		t.Run(action, func(t *testing.T) {
+			got, err := parseAction(action)
+			if err != nil {
+				t.Fatalf("parseAction(%q) unexpected error: %v", action, err)
+			}
+			if got != action {
+				t.Fatalf("parseAction(%q) = %q, want %q", action, got, action)
+			}
+		})
+	}
+}
+
+func TestPlannedV1PublicActionsReturnNotImplemented(t *testing.T) {
+	root := t.TempDir()
+	writeFixtureFile(t, root, "index.html", "home page")
+	cfg := testConfig(t, root)
+
+	req := httptest.NewRequest(http.MethodGet, "/?join", nil)
+	rec := httptest.NewRecorder()
+
+	handleRequest(cfg, rec, req)
+
+	if rec.Result().StatusCode != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want %d", rec.Result().StatusCode, http.StatusNotImplemented)
+	}
+}
+
+func TestPlannedV1MutationActionsRequireAuth(t *testing.T) {
+	root := t.TempDir()
+	writeFixtureFile(t, root, "index.html", "home page")
+	cfg := testConfig(t, root)
+
+	for _, action := range []string{"upload", "grab", "domains", "undelete"} {
+		t.Run(action, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/?"+action, nil)
+			rec := httptest.NewRecorder()
+
+			handleRequest(cfg, rec, req)
+
+			if rec.Result().StatusCode != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want %d", rec.Result().StatusCode, http.StatusUnauthorized)
 			}
 		})
 	}

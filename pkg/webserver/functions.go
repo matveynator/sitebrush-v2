@@ -15,6 +15,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -25,6 +26,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	_ "modernc.org/sqlite"
 )
@@ -626,6 +628,16 @@ func (s siteService) notImplementedMutation(responseWriter http.ResponseWriter, 
 	http.Error(responseWriter, name+" is not implemented yet", http.StatusNotImplemented)
 }
 
+func (s siteService) notImplementedPublic(responseWriter http.ResponseWriter, request *http.Request, name string) {
+	switch request.Method {
+	case http.MethodGet, http.MethodPost:
+		http.Error(responseWriter, name+" is not implemented yet", http.StatusNotImplemented)
+	default:
+		responseWriter.Header().Set("Allow", "GET, POST")
+		http.Error(responseWriter, "Method Not Allowed", http.StatusMethodNotAllowed)
+	}
+}
+
 func (s siteService) requireAuth(responseWriter http.ResponseWriter, request *http.Request) (operatorSession, bool) {
 	session, ok := s.sessions.get(request)
 	if ok {
@@ -658,6 +670,10 @@ func requestedFilePath(config Config.Settings, requestPath string) string {
 }
 
 func safeRequestedFilePath(config Config.Settings, requestPath string) (string, error) {
+	return safePathUnderRoot(config.WEB_FILE_PATH, requestPath, config.WEB_INDEX_FILE, true)
+}
+
+func safePathUnderRoot(root, requestPath, indexFile string, appendIndex bool) (string, error) {
 	if requestPath == "" {
 		requestPath = "/"
 	}
@@ -686,11 +702,11 @@ func safeRequestedFilePath(config Config.Settings, requestPath string) (string, 
 	if relativePath == "." {
 		relativePath = ""
 	}
-	if relativePath == "" || isDirectory {
-		relativePath = pathpkg.Join(relativePath, config.WEB_INDEX_FILE)
+	if appendIndex && (relativePath == "" || isDirectory) {
+		relativePath = pathpkg.Join(relativePath, indexFile)
 	}
 
-	rootPath, err := filepath.Abs(config.WEB_FILE_PATH)
+	rootPath, err := filepath.Abs(root)
 	if err != nil {
 		return "", err
 	}
@@ -720,12 +736,173 @@ func pathIsInsideRoot(rootPath, targetPath string) bool {
 	return relativePath == "." || (!filepath.IsAbs(relativePath) && relativePath != ".." && !strings.HasPrefix(relativePath, ".."+string(filepath.Separator)))
 }
 
+type domainPaths struct {
+	PublicRoot  string
+	ArchiveRoot string
+	CacheRoot   string
+	MediaRoot   string
+}
+
+func canonicalHostFromRequest(request *http.Request) (string, error) {
+	if request == nil {
+		return "", errors.New("missing request")
+	}
+	return canonicalHost(request.Host)
+}
+
+func canonicalHost(host string) (string, error) {
+	if host == "" {
+		return "", errors.New("empty host")
+	}
+	if len(host) > 255 {
+		return "", errors.New("host too long")
+	}
+	if strings.TrimSpace(host) != host {
+		return "", errors.New("invalid host whitespace")
+	}
+	if strings.ContainsAny(host, `/\`) {
+		return "", errors.New("path-like host")
+	}
+	if strings.IndexFunc(host, func(r rune) bool {
+		return unicode.IsControl(r) || unicode.IsSpace(r)
+	}) >= 0 {
+		return "", errors.New("invalid host character")
+	}
+
+	hostOnly := host
+	if strings.HasPrefix(hostOnly, "[") {
+		end := strings.Index(hostOnly, "]")
+		if end <= 1 {
+			return "", errors.New("invalid host")
+		}
+		literal := hostOnly[1:end]
+		if net.ParseIP(literal) == nil {
+			return "", errors.New("invalid bracketed host")
+		}
+		remainder := hostOnly[end+1:]
+		if remainder != "" {
+			if !strings.HasPrefix(remainder, ":") || !allDigits(remainder[1:]) {
+				return "", errors.New("invalid host port")
+			}
+		}
+		hostOnly = literal
+	} else if splitHost, port, err := net.SplitHostPort(hostOnly); err == nil {
+		if !allDigits(port) {
+			return "", errors.New("invalid host port")
+		}
+		hostOnly = splitHost
+	} else if colon := strings.LastIndex(hostOnly, ":"); colon >= 0 {
+		port := hostOnly[colon+1:]
+		candidateHost := hostOnly[:colon]
+		if strings.Count(hostOnly, ":") == 1 && candidateHost != "" && allDigits(port) {
+			hostOnly = candidateHost
+		} else if net.ParseIP(hostOnly) == nil {
+			return "", errors.New("invalid host")
+		}
+	}
+
+	hostOnly = strings.TrimSuffix(strings.ToLower(hostOnly), ".")
+	if hostOnly == "" {
+		return "", errors.New("empty host")
+	}
+	if len(hostOnly) > 253 {
+		return "", errors.New("host too long")
+	}
+	if ip := net.ParseIP(hostOnly); ip != nil {
+		return hostOnly, nil
+	}
+	if hostOnly == "localhost" {
+		return hostOnly, nil
+	}
+	if strings.Contains(hostOnly, "_") {
+		return "", errors.New("invalid host character")
+	}
+
+	labels := strings.Split(hostOnly, ".")
+	for _, label := range labels {
+		if label == "" || len(label) > 63 {
+			return "", errors.New("invalid host label")
+		}
+		if strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return "", errors.New("invalid host label")
+		}
+		for _, r := range label {
+			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+				continue
+			}
+			return "", errors.New("invalid host character")
+		}
+	}
+	return hostOnly, nil
+}
+
+func allDigits(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func (s siteService) domainPaths(host string) (domainPaths, error) {
+	canonical, err := canonicalHost(host)
+	if err != nil {
+		return domainPaths{}, err
+	}
+	publicRoot, err := safeJoinUnderRoot(s.config.WEB_FILE_PATH, "domains", canonical, "public")
+	if err != nil {
+		return domainPaths{}, err
+	}
+	archiveRoot, err := safeJoinUnderRoot(s.archiveRoot(), "domains", canonical)
+	if err != nil {
+		return domainPaths{}, err
+	}
+	cacheRoot, err := safeJoinUnderRoot(archiveRoot, "cache", "cleanhtml")
+	if err != nil {
+		return domainPaths{}, err
+	}
+	mediaRoot, err := safeJoinUnderRoot(archiveRoot, "media")
+	if err != nil {
+		return domainPaths{}, err
+	}
+	return domainPaths{
+		PublicRoot:  publicRoot,
+		ArchiveRoot: archiveRoot,
+		CacheRoot:   cacheRoot,
+		MediaRoot:   mediaRoot,
+	}, nil
+}
+
+func safeJoinUnderRoot(root string, elems ...string) (string, error) {
+	rootPath, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	parts := append([]string{rootPath}, elems...)
+	targetPath, err := filepath.Abs(filepath.Join(parts...))
+	if err != nil {
+		return "", err
+	}
+	if !pathIsInsideRoot(rootPath, targetPath) {
+		return "", errors.New("unsafe path")
+	}
+	return targetPath, nil
+}
+
 func handleRequest(config Config.Settings, responseWriter http.ResponseWriter, request *http.Request) {
 	service := siteService{config: config, sessions: defaultSessions}
 	service.handle(responseWriter, request)
 }
 
 func (s siteService) handle(responseWriter http.ResponseWriter, request *http.Request) {
+	if s.handleLegacyStatic(responseWriter, request) {
+		return
+	}
+
 	fileName, err := safeRequestedFilePath(s.config, request.URL.Path)
 	if err != nil {
 		http.Error(responseWriter, "Forbidden", http.StatusForbidden)
@@ -768,8 +945,66 @@ func (s siteService) handle(responseWriter http.ResponseWriter, request *http.Re
 		s.profile(responseWriter, request)
 	case "logout":
 		s.logout(responseWriter, request)
+	case "join", "verify", "recover", "captcha":
+		s.notImplementedPublic(responseWriter, request, action)
+	case "upload", "grab", "domains", "undelete":
+		s.notImplementedMutation(responseWriter, request, action)
 	default:
 		http.Error(responseWriter, "Not Found", http.StatusNotFound)
+	}
+}
+
+func (s siteService) handleLegacyStatic(responseWriter http.ResponseWriter, request *http.Request) bool {
+	if request.URL.RawQuery != "" {
+		return false
+	}
+	switch {
+	case request.URL.Path == "/b" || strings.HasPrefix(request.URL.Path, "/b/"):
+		http.Error(responseWriter, "Not Found", http.StatusNotFound)
+		return true
+	case request.URL.Path == "/p" || strings.HasPrefix(request.URL.Path, "/p/"),
+		request.URL.Path == "/d" || strings.HasPrefix(request.URL.Path, "/d/"):
+		fileName, err := safeRequestedFilePath(s.config, request.URL.Path)
+		if err != nil {
+			http.Error(responseWriter, "Forbidden", http.StatusForbidden)
+			return true
+		}
+		if !checkFileExist(fileName) {
+			http.Error(responseWriter, "Not Found", http.StatusNotFound)
+			return true
+		}
+		http.ServeFile(responseWriter, request, fileName)
+		return true
+	case request.URL.Path == "/f" || strings.HasPrefix(request.URL.Path, "/f/"):
+		host, err := canonicalHostFromRequest(request)
+		if err != nil {
+			http.Error(responseWriter, "Bad Request", http.StatusBadRequest)
+			return true
+		}
+		roots, err := s.domainPaths(host)
+		if err != nil {
+			http.Error(responseWriter, "Bad Request", http.StatusBadRequest)
+			return true
+		}
+		mediaPath := strings.TrimPrefix(request.URL.Path, "/f")
+		if mediaPath == "" || mediaPath == "/" {
+			http.Error(responseWriter, "Not Found", http.StatusNotFound)
+			return true
+		}
+		fileName, err := safePathUnderRoot(roots.MediaRoot, mediaPath, "", false)
+		if err != nil {
+			http.Error(responseWriter, "Forbidden", http.StatusForbidden)
+			return true
+		}
+		info, err := os.Stat(fileName)
+		if err != nil || info.IsDir() {
+			http.Error(responseWriter, "Not Found", http.StatusNotFound)
+			return true
+		}
+		http.ServeFile(responseWriter, request, fileName)
+		return true
+	default:
+		return false
 	}
 }
 
@@ -786,7 +1021,8 @@ func parseAction(rawQuery string) (string, error) {
 			return "", errors.New("invalid query")
 		}
 		switch key {
-		case "login", "edit", "delete", "revisions", "subpages", "properties", "freeze", "unfreeze", "backup", "profile", "logout":
+		case "login", "edit", "delete", "revisions", "subpages", "properties", "freeze", "unfreeze", "backup", "profile", "logout",
+			"join", "verify", "recover", "upload", "grab", "domains", "undelete", "captcha":
 			return key, nil
 		default:
 			return "", errors.New("unknown action")
