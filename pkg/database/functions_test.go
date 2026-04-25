@@ -510,6 +510,37 @@ func TestSaveAndLoadRedirectFromConfigUpsertsByOldURIAndDomain(t *testing.T) {
 	}
 }
 
+func TestSaveTemplateFromConfigPersistsDetectedTemplateMetadata(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "sitebrush-template.db")
+	cfg := Config.Settings{DB_TYPE: "sqlite", DB_FULL_FILE_PATH: dbPath}
+
+	saved, err := SaveTemplateFromConfig(cfg, Data.Template{
+		Name:   "SiteBrushTemplateHero",
+		Data:   `{"source":"class"}`,
+		Status: "active",
+		Domain: "example.test",
+	})
+	if err != nil {
+		t.Fatalf("SaveTemplateFromConfig(): %v", err)
+	}
+	if saved.Id == 0 {
+		t.Fatal("saved template Id = 0, want database-assigned id")
+	}
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open template db: %v", err)
+	}
+	defer db.Close()
+	var name, data, status, domain string
+	if err := db.QueryRow("SELECT Name, Data, Status, Domain FROM Template WHERE Id = ?", saved.Id).Scan(&name, &data, &status, &domain); err != nil {
+		t.Fatalf("query template row: %v", err)
+	}
+	if name != "SiteBrushTemplateHero" || data != `{"source":"class"}` || status != "active" || domain != "example.test" {
+		t.Fatalf("template row = %q/%q/%q/%q, want saved values", name, data, status, domain)
+	}
+}
+
 func TestSavePostDataInDBAllocatesUniqueRevisionsDuringConcurrentSQLiteSaves(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "sitebrush-concurrent.db")
 	db, err := sql.Open("sqlite", dbPath)

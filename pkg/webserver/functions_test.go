@@ -4,16 +4,19 @@ package webserver
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"image/png"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -1859,6 +1862,291 @@ func TestDBPostRevisionConfiguredSupportsPostgresWithoutFilePath(t *testing.T) {
 	service = siteService{config: Config.Settings{DB_TYPE: "sqlite"}}
 	if service.dbPostRevisionConfigured() {
 		t.Fatal("sqlite DB revisions should require DB_FULL_FILE_PATH")
+	}
+}
+
+func TestGrabRequiresAuthAndCSRF(t *testing.T) {
+	root := t.TempDir()
+	cfg := testConfig(t, root)
+
+	unauthReq := httptest.NewRequest(http.MethodGet, "/?grab", nil)
+	unauthRec := httptest.NewRecorder()
+	handleRequest(cfg, unauthRec, unauthReq)
+	if unauthRec.Result().StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauth grab status = %d, want %d", unauthRec.Result().StatusCode, http.StatusUnauthorized)
+	}
+
+	cfg, cookie, _ := loginTestUser(t)
+	getReq := httptest.NewRequest(http.MethodGet, "/?grab", nil)
+	getReq.AddCookie(cookie)
+	getRec := httptest.NewRecorder()
+	handleRequest(cfg, getRec, getReq)
+	if getRec.Result().StatusCode != http.StatusOK {
+		t.Fatalf("auth grab form status = %d, want %d", getRec.Result().StatusCode, http.StatusOK)
+	}
+
+	form := url.Values{"url": {"https://example.test/page.html"}}
+	postReq := httptest.NewRequest(http.MethodPost, "/?grab", strings.NewReader(form.Encode()))
+	postReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	postReq.AddCookie(cookie)
+	postRec := httptest.NewRecorder()
+	handleRequest(cfg, postRec, postReq)
+	if postRec.Result().StatusCode != http.StatusForbidden {
+		t.Fatalf("no-CSRF grab status = %d, want %d", postRec.Result().StatusCode, http.StatusForbidden)
+	}
+}
+
+func TestGrabImportsAllowedHTMLAndPersistsTemplateMetadata(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><html><head><base href="https://evil.example/"><meta http-equiv="refresh" content="0; url=https://evil.example/"><script>alert(1)</script></head><body><main class="content SiteBrushTemplateHero" data-note="ok"><h1>Imported</h1></main><section data-sitebrush-template="card-list"></section><img src="https://cdn.example.test/a.png"><img src="javascript:alert(1)" onerror="alert(1)"><form action="https://evil.example/post" formaction="javascript:alert(1)"></form></body></html>`)
+	}))
+	defer server.Close()
+
+	restore := allowPrivateGrabNetworksForTest()
+	defer restore()
+
+	cfg, cookie, csrf := loginTestUser(t)
+	cfg.DB_TYPE = "sqlite"
+	cfg.DB_FULL_FILE_PATH = filepath.Join(t.TempDir(), "sitebrush-grab.db")
+	form := url.Values{
+		"csrf":        {csrf},
+		"url":         {server.URL + "/remote.html"},
+		"target_path": {"/imported.html"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/?grab", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+
+	handleRequest(cfg, rec, req)
+
+	if rec.Result().StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(rec.Result().Body)
+		t.Fatalf("grab status = %d body = %q, want success", rec.Result().StatusCode, string(body))
+	}
+	imported, err := os.ReadFile(filepath.Join(cfg.WEB_FILE_PATH, "imported.html"))
+	if err != nil {
+		t.Fatalf("read imported file: %v", err)
+	}
+	if !strings.Contains(string(imported), "Imported") || !strings.Contains(string(imported), `https://cdn.example.test/a.png`) {
+		t.Fatalf("imported html = %q, want remote content with external asset unchanged", string(imported))
+	}
+	for _, blocked := range []string{"<script", "alert(1)", "onerror", "javascript:", "<base", "http-equiv=\"refresh\"", "https://evil.example/post"} {
+		if strings.Contains(strings.ToLower(string(imported)), strings.ToLower(blocked)) {
+			t.Fatalf("imported html = %q, want sanitized content without %q", string(imported), blocked)
+		}
+	}
+
+	service := siteService{config: cfg, sessions: defaultSessions}
+	records, err := service.loadRevisions("/imported.html")
+	if err != nil {
+		t.Fatalf("load grab revisions: %v", err)
+	}
+	if len(records) != 1 || !strings.Contains(records[0].AfterContent, "Imported") {
+		t.Fatalf("grab revisions = %+v, want one revision with imported content", records)
+	}
+
+	sidecarData, err := os.ReadFile(service.templateMetadataPath("/imported.html"))
+	if err != nil {
+		t.Fatalf("read template sidecar: %v", err)
+	}
+	if !strings.Contains(string(sidecarData), "SiteBrushTemplateHero") || !strings.Contains(string(sidecarData), "card-list") {
+		t.Fatalf("template sidecar = %q, want both markers", string(sidecarData))
+	}
+
+	db, err := sql.Open("sqlite", cfg.DB_FULL_FILE_PATH)
+	if err != nil {
+		t.Fatalf("open grab db: %v", err)
+	}
+	defer db.Close()
+	var templateCount int
+	if err := db.QueryRow("SELECT COUNT(*) FROM Template WHERE Status = 'active'").Scan(&templateCount); err != nil {
+		t.Fatalf("query template rows: %v", err)
+	}
+	if templateCount != 2 {
+		t.Fatalf("template rows = %d, want 2", templateCount)
+	}
+}
+
+func TestGrabBlocksLocalAndPrivateDirectIPURLs(t *testing.T) {
+	cfg, cookie, csrf := loginTestUser(t)
+	for _, rawURL := range []string{"http://127.0.0.1/", "http://[::1]/", "http://10.0.0.1/", "http://169.254.169.254/"} {
+		t.Run(rawURL, func(t *testing.T) {
+			form := url.Values{"csrf": {csrf}, "url": {rawURL}}
+			req := httptest.NewRequest(http.MethodPost, "/?grab", strings.NewReader(form.Encode()))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req.AddCookie(cookie)
+			rec := httptest.NewRecorder()
+
+			handleRequest(cfg, rec, req)
+
+			if rec.Result().StatusCode != http.StatusBadRequest {
+				t.Fatalf("blocked grab status = %d, want %d", rec.Result().StatusCode, http.StatusBadRequest)
+			}
+			if _, err := fetchGrabHTML(context.Background(), rawURL, grabFetchOptions{Resolver: net.DefaultResolver}); !errors.Is(err, errGrabUnsafeURL) {
+				t.Fatalf("fetchGrabHTML(%q) err = %v, want errGrabUnsafeURL", rawURL, err)
+			}
+		})
+	}
+}
+
+func TestGrabRejectsSpecialUseIPAddresses(t *testing.T) {
+	tests := []string{
+		"0.0.0.1",
+		"100.64.0.1",
+		"198.18.0.1",
+		"192.0.2.10",
+		"198.51.100.10",
+		"203.0.113.10",
+		"240.0.0.1",
+		"::ffff:192.168.0.1",
+		"64:ff9b::192.0.2.33",
+		"2001:2::1",
+		"2001:db8::1",
+		"fc00::1",
+	}
+
+	for _, rawIP := range tests {
+		t.Run(rawIP, func(t *testing.T) {
+			if err := validateGrabIP(net.ParseIP(rawIP), grabFetchOptions{}); !errors.Is(err, errGrabUnsafeURL) {
+				t.Fatalf("validateGrabIP(%q) err = %v, want errGrabUnsafeURL", rawIP, err)
+			}
+		})
+	}
+}
+
+func TestGrabRejectsNonHTMLContent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, "not html")
+	}))
+	defer server.Close()
+
+	restore := allowPrivateGrabNetworksForTest()
+	defer restore()
+
+	cfg, cookie, csrf := loginTestUser(t)
+	form := url.Values{"csrf": {csrf}, "url": {server.URL}}
+	req := httptest.NewRequest(http.MethodPost, "/?grab", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+
+	handleRequest(cfg, rec, req)
+
+	if rec.Result().StatusCode != http.StatusUnsupportedMediaType {
+		t.Fatalf("non-HTML grab status = %d, want %d", rec.Result().StatusCode, http.StatusUnsupportedMediaType)
+	}
+}
+
+func TestGrabEnforcesResponseSizeCap(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, strings.Repeat("a", int(maxGrabResponseBytes)+1))
+	}))
+	defer server.Close()
+
+	restore := allowPrivateGrabNetworksForTest()
+	defer restore()
+
+	cfg, cookie, csrf := loginTestUser(t)
+	form := url.Values{"csrf": {csrf}, "url": {server.URL}}
+	req := httptest.NewRequest(http.MethodPost, "/?grab", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+
+	handleRequest(cfg, rec, req)
+
+	if rec.Result().StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized grab status = %d, want %d", rec.Result().StatusCode, http.StatusRequestEntityTooLarge)
+	}
+}
+
+func TestSanitizeImportedHTMLRemovesActiveContentAndDangerousAttributes(t *testing.T) {
+	input := `<html><head><base href="https://evil.example/"><meta http-equiv="refresh" content="0; url=https://evil.example/"><style>body{color:red}</style><script>alert(1)</script></head><body onload="alert(2)"><img src="javascript:alert(3)" onerror="alert(4)"><a href="JaVa&#x53;cript:alert(5)" onclick="alert(6)">bad</a><iframe src="https://evil.example/frame"></iframe><object data="x"></object><form action="https://evil.example/post"><button formaction="javascript:alert(7)">Go</button></form><img src="https://cdn.example.test/ok.png"></body></html>`
+
+	sanitized := sanitizeImportedHTML(input)
+	lower := strings.ToLower(sanitized)
+
+	for _, blocked := range []string{
+		"<script",
+		"alert(1)",
+		"onload",
+		"onerror",
+		"onclick",
+		"javascript:",
+		"javasc",
+		"<base",
+		"http-equiv=\"refresh\"",
+		"<iframe",
+		"<object",
+		"https://evil.example/post",
+	} {
+		if strings.Contains(lower, strings.ToLower(blocked)) {
+			t.Fatalf("sanitizeImportedHTML() = %q, want no %q", sanitized, blocked)
+		}
+	}
+	if !strings.Contains(sanitized, "<style>body{color:red}</style>") {
+		t.Fatalf("sanitizeImportedHTML() = %q, want style retained by conservative foundation", sanitized)
+	}
+	if !strings.Contains(sanitized, `src="https://cdn.example.test/ok.png"`) {
+		t.Fatalf("sanitizeImportedHTML() = %q, want ordinary external image URL retained", sanitized)
+	}
+}
+
+func TestDetectTemplateMarkersIsDeterministic(t *testing.T) {
+	html := `<div class="alpha SiteBrushTemplate beta"></div><section data-sitebrush-template="cards"></section><p class="other"></p>`
+
+	first := detectTemplateMarkers(html)
+	second := detectTemplateMarkers(html)
+
+	if len(first) != 2 {
+		t.Fatalf("template markers = %+v, want 2", first)
+	}
+	if first[0].Name != "SiteBrushTemplate" || first[0].Source != "class" || first[0].Tag != "div" {
+		t.Fatalf("first marker = %+v, want class SiteBrushTemplate div", first[0])
+	}
+	if first[1].Name != "cards" || first[1].Source != "data-sitebrush-template" || first[1].Tag != "section" {
+		t.Fatalf("second marker = %+v, want data-sitebrush-template cards section", first[1])
+	}
+	if fmt.Sprintf("%+v", first) != fmt.Sprintf("%+v", second) {
+		t.Fatalf("detectTemplateMarkers not deterministic: first=%+v second=%+v", first, second)
+	}
+}
+
+func TestDetectTemplateMarkersRejectsUnsafeNamesAndCapsCount(t *testing.T) {
+	var html strings.Builder
+	html.WriteString(`<div data-sitebrush-template="../escape"></div>`)
+	html.WriteString(`<div data-sitebrush-template="` + strings.Repeat("a", maxTemplateMarkerNameLen+1) + `"></div>`)
+	for i := 0; i < maxTemplateMarkersPerPage+10; i++ {
+		fmt.Fprintf(&html, `<section data-sitebrush-template="card-%d"></section>`, i)
+	}
+
+	markers := detectTemplateMarkers(html.String())
+	if len(markers) != maxTemplateMarkersPerPage {
+		t.Fatalf("template marker count = %d, want cap %d", len(markers), maxTemplateMarkersPerPage)
+	}
+	for _, marker := range markers {
+		if !validTemplateMarkerName(marker.Name) {
+			t.Fatalf("marker name %q was not validated", marker.Name)
+		}
+		if marker.Name == "../escape" || len(marker.Name) > maxTemplateMarkerNameLen {
+			t.Fatalf("unsafe marker survived: %+v", marker)
+		}
+	}
+}
+
+func allowPrivateGrabNetworksForTest() func() {
+	previous := defaultGrabOptions
+	defaultGrabOptions.AllowPrivateNetworksForTests = true
+	defaultGrabOptions.Timeout = 2 * time.Second
+	defaultGrabOptions.MaxRedirects = maxGrabRedirects
+	defaultGrabOptions.MaxResponseBytes = maxGrabResponseBytes
+	defaultGrabOptions.Resolver = net.DefaultResolver
+	return func() {
+		defaultGrabOptions = previous
 	}
 }
 

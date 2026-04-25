@@ -1742,7 +1742,9 @@ func (s siteService) handle(responseWriter http.ResponseWriter, request *http.Re
 		s.notImplementedPublic(responseWriter, request, action)
 	case "upload":
 		s.upload(responseWriter, request)
-	case "grab", "domains", "undelete":
+	case "grab":
+		s.grab(responseWriter, request, fileName)
+	case "domains", "undelete":
 		s.notImplementedMutation(responseWriter, request, action)
 	default:
 		http.Error(responseWriter, "Not Found", http.StatusNotFound)
@@ -2377,6 +2379,21 @@ const propertiesTemplate = `
   <label>New path <input name="new_path" value="{{.Data.NewPath}}"></label>
   <button type="submit">Save properties</button>
 </form>`
+
+const grabFormTemplate = `
+<p>Import one remote HTML page into this SiteBrush page. Recursive asset fetching and template propagation are deferred for safety.</p>
+<form method="post" action="{{.Data.Action}}">
+  <input type="hidden" name="csrf" value="{{.Data.CSRF}}">
+  <label>Remote URL <input type="url" name="url" placeholder="https://example.com/page.html" required></label>
+  <label>Target path <input name="target_path" placeholder="leave blank for current page"></label>
+  <button type="submit">Import HTML</button>
+</form>`
+
+const grabResultTemplate = `
+<p>Imported {{.Data.ImportedURI}} from {{.Data.URL}}.</p>
+{{if ne .Data.FinalURL .Data.URL}}<p>Final URL after redirects: {{.Data.FinalURL}}</p>{{end}}
+{{if .Data.Templates}}<h2>Detected templates</h2><ul>{{range .Data.Templates}}<li>{{.Name}} via {{.Source}} on &lt;{{.Tag}}&gt;</li>{{end}}</ul>{{else}}<p>No SiteBrush template markers detected.</p>{{end}}
+{{if .Data.Warnings}}<h2>Warnings</h2><ul>{{range .Data.Warnings}}<li>{{.}}</li>{{end}}</ul>{{end}}`
 
 const profileTemplate = `
 <p>User: {{.Data.User}}</p>
