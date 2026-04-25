@@ -133,5 +133,5 @@ These changes are expected to break some legacy behaviors by design.
 | 8. Grab/import | Remote HTML import, recursive asset grab, media records | External pages import with local `/f` assets and SSRF protections. |
 | 9. Freeze, publish, cache, cleanhtml | Domain-scoped freeze state, draft/public split, publish rebuild | Visitors see stable public HTML while editors can preview drafts. |
 | 10. Backup/export and recovery | Backup creation, download, metadata, restore/import checks | Export is authenticated, checksummed, and restorable in a fixture test. |
-| 11. Migration tooling | MySQL v1 import to v2 schema | Fixture import preserves domains, users, groups, posts, media, templates, and redirects. |
+| 11. Migration tooling | MySQL v1 import to v2 schema | Partial. `pkg/migration` now provides pure v1 row-to-v2 data mapping and import-plan warnings for domains, posts, URI redirects/maps, users, groups, media, templates, and post-template links. Full `sitebrush.sql` dump parsing and DB write orchestration are the next migration slice. |
 | 12. Final validation | Unit, HTTP, migration, browser smoke, `go test ./...`, `go build ./...`, `git diff --check` | Branch is ready for the single final PR review. |
